@@ -97,7 +97,7 @@ final class WindowBuddyModel: ObservableObject {
         didSet {
             userDefaults.set(showsDockIcon, forKey: Self.showsDockIconDefaultsKey)
             applyActivationPolicy()
-            statusMessage = showsDockIcon ? "Dock icon is visible." : "WindowOrchestrator is menu bar only."
+            statusMessage = showsDockIcon ? "Dock icon is visible." : "WindowBuddy is menu bar only."
         }
     }
 

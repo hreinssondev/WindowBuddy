@@ -94,7 +94,7 @@ enum WindowMoveError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .accessibilityNotTrusted:
-            "Accessibility permission is required before WindowOrchestrator can move windows."
+            "Accessibility permission is required before WindowBuddy can move windows."
         case .noFrontmostApplication:
             "No frontmost application was found."
         case let .noFocusedWindow(applicationName):

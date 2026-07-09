@@ -1,6 +1,6 @@
 //
 //  WindowBuddyApp.swift
-//  WindowOrchestrator
+//  WindowBuddy
 //
 //  Created by H on 30/05/2026.
 //
@@ -81,7 +81,7 @@ final class WindowBuddyAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private static func menuBarImage() -> NSImage? {
-        let image = NSImage(systemSymbolName: "rectangle.3.group", accessibilityDescription: "WindowOrchestrator")
+        let image = NSImage(systemSymbolName: "rectangle.3.group", accessibilityDescription: "WindowBuddy")
         image?.isTemplate = true
         return image
     }
@@ -104,7 +104,7 @@ private final class WindowBuddySettingsWindowPresenter {
     private func makeWindowController(model: WindowBuddyModel) -> NSWindowController {
         let hostingController = NSHostingController(rootView: WindowBuddySettingsView(model: model))
         let window = NSWindow(contentViewController: hostingController)
-        window.title = "WindowOrchestrator Settings"
+        window.title = "WindowBuddy Settings"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         window.isReleasedWhenClosed = false
         window.collectionBehavior = [.moveToActiveSpace]
