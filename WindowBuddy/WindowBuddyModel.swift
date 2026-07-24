@@ -38,6 +38,36 @@ final class WindowBuddyModel: ObservableObject {
         }
     }
 
+    @Published var excludesManuallyMovedWindowsFromAutoTiling: Bool {
+        didSet {
+            userDefaults.set(excludesManuallyMovedWindowsFromAutoTiling,
+                             forKey: Self.excludesManuallyMovedWindowsFromAutoTilingDefaultsKey)
+            autoTiler.excludesManuallyMovedWindowsFromAutoTiling = excludesManuallyMovedWindowsFromAutoTiling
+            if excludesManuallyMovedWindowsFromAutoTiling {
+                statusMessage = "Move or snap a window once to exclude it; do so again to resume auto tiling."
+            } else if keepsFullSizeWindowsOutOfAutoTiling {
+                statusMessage = "The two-move cycle remains active through the full-size exclusion setting."
+            } else {
+                statusMessage = "Manually moved windows can return to auto tiling."
+            }
+        }
+    }
+
+    @Published var keepsFullSizeWindowsOutOfAutoTiling: Bool {
+        didSet {
+            userDefaults.set(keepsFullSizeWindowsOutOfAutoTiling,
+                             forKey: Self.keepsFullSizeWindowsOutOfAutoTilingDefaultsKey)
+            autoTiler.keepsFullSizeWindowsOutOfAutoTiling = keepsFullSizeWindowsOutOfAutoTiling
+            if keepsFullSizeWindowsOutOfAutoTiling {
+                statusMessage = "Full-size windows stay untiled, with the same two-action cycle for manual moves and snaps."
+            } else if excludesManuallyMovedWindowsFromAutoTiling {
+                statusMessage = "The two-move cycle remains active for manually moved windows."
+            } else {
+                statusMessage = "Full-size windows can return to auto tiling."
+            }
+        }
+    }
+
     @Published var widensFocusedAutoTileWindow: Bool {
         didSet {
             userDefaults.set(widensFocusedAutoTileWindow, forKey: Self.widensFocusedAutoTileWindowDefaultsKey)
@@ -93,6 +123,34 @@ final class WindowBuddyModel: ObservableObject {
         }
     }
 
+    @Published var focusGroupSwitchDelay: Double {
+        didSet {
+            let normalizedDelay = Self.normalizedFocusGroupSwitchDelay(focusGroupSwitchDelay)
+
+            if normalizedDelay != focusGroupSwitchDelay {
+                focusGroupSwitchDelay = normalizedDelay
+                return
+            }
+
+            userDefaults.set(normalizedDelay,
+                             forKey: Self.focusGroupSwitchDelayDefaultsKey)
+            reschedulePendingFocusGroupSwitchIfNeeded()
+            statusMessage = normalizedDelay == 0 ?
+                "Focus groups switch without an added delay." :
+                "Focus group switches are spaced \(Self.focusGroupSwitchDelayText(for: normalizedDelay)) apart."
+        }
+    }
+
+    @Published var switchesAwayFromSingleAppFocusGroups: Bool {
+        didSet {
+            userDefaults.set(switchesAwayFromSingleAppFocusGroups,
+                             forKey: Self.switchesAwayFromSingleAppFocusGroupsDefaultsKey)
+            statusMessage = switchesAwayFromSingleAppFocusGroups ?
+                "Single-app focus groups switch to the other focused group." :
+                "Single-app focus groups use hide and reveal."
+        }
+    }
+
     @Published var showsDockIcon: Bool {
         didSet {
             userDefaults.set(showsDockIcon, forKey: Self.showsDockIconDefaultsKey)
@@ -100,29 +158,48 @@ final class WindowBuddyModel: ObservableObject {
             statusMessage = showsDockIcon ? "Dock icon is visible." : "WindowBuddy is menu bar only."
         }
     }
+    @Published private(set) var settingsShortcut: DockMoverShortcut
+    @Published private(set) var focusGroupsForwardShortcut: DockMoverShortcut
+    @Published private(set) var focusGroupsBackwardShortcut: DockMoverShortcut
+    @Published private(set) var focusGroupOnePhysicalKey: FocusGroupPhysicalKey
+    @Published private(set) var focusGroupTwoPhysicalKey: FocusGroupPhysicalKey
+    @Published private(set) var focusGroupPhysicalKeyValidationMessage: String?
 
     @Published private(set) var accessibilityGranted = AXIsProcessTrusted()
     @Published private(set) var statusMessage = "Waiting for Accessibility permission."
     @Published private(set) var autoTileAppGroups: [AutoTileAppGroup] = []
     @Published private(set) var focusTileWiderFixedAutoTileAppBundleIdentifiers: Set<String> = []
     @Published private(set) var focusGroupIdentifiers: [Int] = []
+    @Published private(set) var focusedGroupNumberByGroup: [Int: Int] = [:]
     @Published private(set) var activeFocusGroupIdentifier: Int?
+    @Published private(set) var activeSecondaryFocusGroupIdentifier: Int?
     @Published private(set) var availableAutoTileApps: [AutoTileAppSelection] = []
     @Published private(set) var isLoadingAvailableAutoTileApps = false
 
     private static let autoTilingEnabledDefaultsKey = "autoTilingEnabled"
     private static let instantWindowMovementDefaultsKey = "instantWindowMovement"
+    private static let excludesManuallyMovedWindowsFromAutoTilingDefaultsKey = "excludesManuallyMovedWindowsFromAutoTiling"
+    private static let keepsFullSizeWindowsOutOfAutoTilingDefaultsKey = "keepsFullSizeWindowsOutOfAutoTiling"
     private static let focusTileWiderFixedBundleIdentifiersDefaultsKey = "focusTileWiderFixedBundleIdentifiers"
     private static let focusTileWiderResizableBundleIdentifiersDefaultsKey = "focusTileWiderResizableBundleIdentifiers"
     private static let focusGroupIdentifiersDefaultsKey = "focusGroupIdentifiers"
+    private static let focusedGroupNumberByGroupDefaultsKey = "focusedGroupNumberByGroup"
     private static let activeFocusGroupIdentifierDefaultsKey = "activeFocusGroupIdentifier"
+    private static let activeSecondaryFocusGroupIdentifierDefaultsKey = "activeSecondaryFocusGroupIdentifier"
     private static let existingFirstNewWindowBundleIdentifiersDefaultsKey = "existingFirstNewWindowBundleIdentifiers"
     private static let widensFocusedAutoTileWindowDefaultsKey = "widensFocusedAutoTileWindow"
     private static let focusedAutoTileWindowWidthFractionDefaultsKey = "focusedAutoTileWindowWidthFraction"
     private static let movesExistingAutoTileAppWindowsToFocusedGroupDefaultsKey = "movesExistingAutoTileAppWindowsToFocusedGroup"
     private static let revealsActiveAutoTileGroupAppsDefaultsKey = "revealsActiveAutoTileGroupApps"
     private static let focusGroupSwitchingHidesOthersDefaultsKey = "focusGroupSwitchingHidesOthers"
+    private static let focusGroupSwitchDelayDefaultsKey = "focusGroupSwitchDelay"
+    private static let switchesAwayFromSingleAppFocusGroupsDefaultsKey = "switchesAwayFromSingleAppFocusGroups"
     private static let showsDockIconDefaultsKey = "showsDockIcon"
+    private static let settingsShortcutDefaultsKey = "windowBuddySettingsShortcut"
+    private static let focusGroupsForwardShortcutDefaultsKey = "focusGroupsForwardShortcut"
+    private static let focusGroupsBackwardShortcutDefaultsKey = "focusGroupsBackwardShortcut"
+    private static let focusGroupOnePhysicalKeyDefaultsKey = "focusGroupOnePhysicalKeyCode"
+    private static let focusGroupTwoPhysicalKeyDefaultsKey = "focusGroupTwoPhysicalKeyCode"
     private static let fillsFirstWindowByGroupDefaultsKey = "fillsFirstWindowByGroup"
     private static let screenLayoutModeByGroupDefaultsKey = "screenLayoutModeByGroup"
     private static let maximumColumnCountByGroupDefaultsKey = "maximumColumnCountByGroup"
@@ -138,6 +215,13 @@ final class WindowBuddyModel: ObservableObject {
     private static let defaultMaximumColumnCount = 3
     static let focusedAutoTileWindowWidthFractionRange: ClosedRange<Double> = 0.52...0.85
     private static let defaultFocusedAutoTileWindowWidthFraction = 0.56
+    static let focusGroupSwitchDelayRange: ClosedRange<Double> = 0...0.5
+    private static let defaultFocusGroupSwitchDelay = 0.0
+
+    private struct FocusGroupSwitchRequest {
+        let reverse: Bool
+        let number: Int
+    }
 
     private let userDefaults: UserDefaults
     private let mover = AccessibilityWindowMover()
@@ -153,6 +237,11 @@ final class WindowBuddyModel: ObservableObject {
     private var ignoresSecondAppInListByGroup: [Int: Bool] = [:]
     private var ignoredSecondWindowStartModeByGroup: [Int: AutoTileIgnoredSecondWindowStartMode] = [:]
     private var focusTileWiderResizableBundleIdentifiers: Set<String> = []
+    private var lastCycledFocusGroupNumber: Int?
+    private var focusGroupTransitionDeadlineByNumber: [Int: Date] = [:]
+    private var pendingFocusGroupSwitchRequests: [FocusGroupSwitchRequest] = []
+    private var pendingFocusGroupSwitchTask: Task<Void, Never>?
+    private var lastFocusGroupSwitchExecutionDate: Date?
     private var hasLoadedAvailableAutoTileApps = false
     private lazy var autoTiler = AutoTiler(mover: mover,
                                            appGroupIdentifiersByBundleIdentifier: autoTileAppGroupIdentifiersByBundleIdentifier,
@@ -165,6 +254,8 @@ final class WindowBuddyModel: ObservableObject {
                                            focusedWindowPrimaryWidthFraction: CGFloat(focusedAutoTileWindowWidthFraction),
                                            movesExistingAppWindowsToFocusedGroup: movesExistingAutoTileAppWindowsToFocusedGroup,
                                            revealsActiveGroupApps: revealsActiveAutoTileGroupApps,
+                                           excludesManuallyMovedWindowsFromAutoTiling: excludesManuallyMovedWindowsFromAutoTiling,
+                                           keepsFullSizeWindowsOutOfAutoTiling: keepsFullSizeWindowsOutOfAutoTiling,
                                            fillsFirstWindowByGroup: fillsFirstWindowByGroup,
                                            screenLayoutModeByGroup: screenLayoutModeByGroup,
                                            maximumColumnCountByGroup: maximumColumnCountByGroup,
@@ -217,15 +308,35 @@ final class WindowBuddyModel: ObservableObject {
                                                                                                     appGroups: autoTileAppBundleIdentifiersByGroup)
         let storedFocusGroupIdentifiers = Self.storedFocusGroupIdentifiers(in: userDefaults,
                                                                            appGroups: autoTileAppBundleIdentifiersByGroup)
+        let storedFocusedGroupNumberByGroup = Self.storedFocusedGroupNumberByGroup(in: userDefaults,
+                                                                                   appGroups: autoTileAppBundleIdentifiersByGroup,
+                                                                                   legacyFocusGroupIdentifiers: storedFocusGroupIdentifiers)
         focusGroupIdentifiers = storedFocusGroupIdentifiers
+        focusedGroupNumberByGroup = storedFocusedGroupNumberByGroup
         activeFocusGroupIdentifier = Self.storedActiveFocusGroupIdentifier(in: userDefaults,
                                                                            focusGroupIdentifiers: storedFocusGroupIdentifiers)
+        activeSecondaryFocusGroupIdentifier = Self.storedActiveFocusGroupIdentifier(in: userDefaults,
+                                                                                   key: Self.activeSecondaryFocusGroupIdentifierDefaultsKey,
+                                                                                   focusGroupIdentifiers: Self.focusGroupIdentifiers(in: storedFocusedGroupNumberByGroup,
+                                                                                                                                      number: 2))
 
         if userDefaults.object(forKey: Self.instantWindowMovementDefaultsKey) == nil {
             usesInstantWindowMovement = true
         } else {
             usesInstantWindowMovement = userDefaults.bool(forKey: Self.instantWindowMovementDefaultsKey)
         }
+
+        if userDefaults.object(forKey: Self.excludesManuallyMovedWindowsFromAutoTilingDefaultsKey) == nil {
+            excludesManuallyMovedWindowsFromAutoTiling = false
+        } else {
+            excludesManuallyMovedWindowsFromAutoTiling = userDefaults.bool(
+                forKey: Self.excludesManuallyMovedWindowsFromAutoTilingDefaultsKey
+            )
+        }
+
+        // Keeping full-size windows untiled is now always on and no longer
+        // configurable from the UI.
+        keepsFullSizeWindowsOutOfAutoTiling = true
 
         if userDefaults.object(forKey: Self.widensFocusedAutoTileWindowDefaultsKey) == nil {
             widensFocusedAutoTileWindow = true
@@ -257,11 +368,54 @@ final class WindowBuddyModel: ObservableObject {
             focusGroupSwitchingHidesOthers = userDefaults.bool(forKey: Self.focusGroupSwitchingHidesOthersDefaultsKey)
         }
 
+        if userDefaults.object(forKey: Self.focusGroupSwitchDelayDefaultsKey) == nil {
+            focusGroupSwitchDelay = Self.defaultFocusGroupSwitchDelay
+        } else {
+            focusGroupSwitchDelay = Self.normalizedFocusGroupSwitchDelay(
+                userDefaults.double(forKey: Self.focusGroupSwitchDelayDefaultsKey)
+            )
+        }
+
+        if userDefaults.object(forKey: Self.switchesAwayFromSingleAppFocusGroupsDefaultsKey) == nil {
+            switchesAwayFromSingleAppFocusGroups = true
+        } else {
+            switchesAwayFromSingleAppFocusGroups = userDefaults.bool(
+                forKey: Self.switchesAwayFromSingleAppFocusGroupsDefaultsKey
+            )
+        }
+
         if userDefaults.object(forKey: Self.showsDockIconDefaultsKey) == nil {
             showsDockIcon = true
         } else {
             showsDockIcon = userDefaults.bool(forKey: Self.showsDockIconDefaultsKey)
         }
+        settingsShortcut = Self.storedShortcut(in: userDefaults,
+                                               key: Self.settingsShortcutDefaultsKey,
+                                               defaultShortcut: .windowBuddySettingsDefault)
+        focusGroupsForwardShortcut = Self.storedShortcut(in: userDefaults,
+                                                         key: Self.focusGroupsForwardShortcutDefaultsKey,
+                                                         defaultShortcut: .focusGroupsForwardDefault)
+        focusGroupsBackwardShortcut = Self.storedShortcut(in: userDefaults,
+                                                          key: Self.focusGroupsBackwardShortcutDefaultsKey,
+                                                          defaultShortcut: .focusGroupsBackwardDefault)
+        let storedGroupOnePhysicalKey = Self.storedPhysicalKey(in: userDefaults,
+                                                              key: Self.focusGroupOnePhysicalKeyDefaultsKey,
+                                                              defaultKey: .groupOneDefault)
+        let storedGroupTwoPhysicalKey = Self.storedPhysicalKey(in: userDefaults,
+                                                              key: Self.focusGroupTwoPhysicalKeyDefaultsKey,
+                                                              defaultKey: .groupTwoDefault)
+        if FocusGroupPhysicalKey.conflicts(storedGroupOnePhysicalKey, storedGroupTwoPhysicalKey) {
+            focusGroupOnePhysicalKey = .groupOneDefault
+            focusGroupTwoPhysicalKey = .groupTwoDefault
+            userDefaults.set(Int(FocusGroupPhysicalKey.groupOneDefault.keyCode),
+                             forKey: Self.focusGroupOnePhysicalKeyDefaultsKey)
+            userDefaults.set(Int(FocusGroupPhysicalKey.groupTwoDefault.keyCode),
+                             forKey: Self.focusGroupTwoPhysicalKeyDefaultsKey)
+        } else {
+            focusGroupOnePhysicalKey = storedGroupOnePhysicalKey
+            focusGroupTwoPhysicalKey = storedGroupTwoPhysicalKey
+        }
+        focusGroupPhysicalKeyValidationMessage = nil
 
         mover.usesInstantWindowMovement = usesInstantWindowMovement
     }
@@ -302,6 +456,10 @@ final class WindowBuddyModel: ObservableObject {
         Self.focusedAutoTileWindowWidthText(for: focusedAutoTileWindowWidthFraction)
     }
 
+    var focusGroupSwitchDelayText: String {
+        Self.focusGroupSwitchDelayText(for: focusGroupSwitchDelay)
+    }
+
     var focusTileWiderResizableAutoTileApps: [AutoTileAppSelection] {
         selectedAutoTileApps.filter { focusTileWiderResizableBundleIdentifiers.contains($0.bundleIdentifier) }
     }
@@ -319,6 +477,13 @@ final class WindowBuddyModel: ObservableObject {
             return
         }
 
+        let focusedBundleIdentifiers = focusedGroupNumberByGroup.keys.reduce(into: Set<String>()) { identifiers, groupIdentifier in
+            identifiers.formUnion(autoTileAppBundleIdentifiersByGroup[groupIdentifier] ?? [])
+        }
+        // Earlier builds minimized focus-group windows. Restore that legacy
+        // state while the apps are still hidden so the first app-level reveal
+        // also appears as one group instead of animating window by window.
+        _ = mover.prepareHiddenApplicationsForAppLevelReveal(bundleIdentifiers: focusedBundleIdentifiers)
         updateAutoTilerState()
     }
 
@@ -328,6 +493,11 @@ final class WindowBuddyModel: ObservableObject {
 
     func stop() {
         autoTiler.stop()
+        focusGroupTransitionDeadlineByNumber = [:]
+        pendingFocusGroupSwitchTask?.cancel()
+        pendingFocusGroupSwitchTask = nil
+        pendingFocusGroupSwitchRequests = []
+        lastFocusGroupSwitchExecutionDate = nil
         statusMessage = "Auto tiling stopped."
     }
 
@@ -559,56 +729,249 @@ final class WindowBuddyModel: ObservableObject {
         focusGroupIdentifiers.contains(group.index)
     }
 
+    func focusedGroupNumber(in group: AutoTileAppGroup) -> Int {
+        focusedGroupNumberByGroup[group.index] ?? 0
+    }
+
     func setFocusGroup(_ isFocusGroup: Bool, in group: AutoTileAppGroup) {
+        setFocusedGroupNumber(isFocusGroup ? 1 : 0, in: group)
+    }
+
+    func setFocusedGroupNumber(_ number: Int, in group: AutoTileAppGroup) {
         guard !group.apps.isEmpty else {
             statusMessage = "\(group.title) needs apps before it can be a focus group."
             return
         }
 
-        var identifiers = focusGroupIdentifiers.filter { $0 != group.index }
-
-        if isFocusGroup {
-            identifiers.append(group.index)
-        } else if activeFocusGroupIdentifier == group.index {
-            activeFocusGroupIdentifier = nil
-            userDefaults.removeObject(forKey: Self.activeFocusGroupIdentifierDefaultsKey)
+        var numbers = focusedGroupNumberByGroup
+        if number == 1 || number == 2 || number == 3 {
+            numbers[group.index] = number
+        } else {
+            numbers.removeValue(forKey: group.index)
         }
 
-        setFocusGroupIdentifiers(identifiers)
-        statusMessage = isFocusGroup ? "\(group.title) is a focus group." : "\(group.title) is not a focus group."
+        setFocusedGroupNumberByGroup(numbers)
+        switch number {
+        case 1, 2:
+            statusMessage = "\(group.title) is focused group \(number)."
+        case 3:
+            statusMessage = "\(group.title) is focused group 1+2."
+        default:
+            statusMessage = "\(group.title) is not a focused group."
+        }
     }
 
-    func toggleFocusGroups() {
+    func setSettingsShortcut(_ shortcut: DockMoverShortcut) {
+        guard shortcut != settingsShortcut else {
+            statusMessage = "Settings shortcut is already \(shortcut.displayText)."
+            return
+        }
+
+        settingsShortcut = shortcut
+        persistShortcut(shortcut, key: Self.settingsShortcutDefaultsKey)
+        statusMessage = "Settings shortcut saved as \(shortcut.displayText)."
+    }
+
+    func setFocusGroupsForwardShortcut(_ shortcut: DockMoverShortcut) {
+        focusGroupsForwardShortcut = shortcut
+        persistShortcut(shortcut, key: Self.focusGroupsForwardShortcutDefaultsKey)
+        statusMessage = "Forward focus group shortcut saved as \(shortcut.displayText)."
+    }
+
+    func setFocusGroupsBackwardShortcut(_ shortcut: DockMoverShortcut) {
+        focusGroupsBackwardShortcut = shortcut
+        persistShortcut(shortcut, key: Self.focusGroupsBackwardShortcutDefaultsKey)
+        statusMessage = "Backward focus group shortcut saved as \(shortcut.displayText)."
+    }
+
+    @discardableResult
+    func setFocusGroupPhysicalKey(_ key: FocusGroupPhysicalKey,
+                                  number: Int) -> Bool {
+        guard number == 1 || number == 2 else {
+            return false
+        }
+
+        let otherKey = number == 1 ? focusGroupTwoPhysicalKey : focusGroupOnePhysicalKey
+        guard !FocusGroupPhysicalKey.conflicts(key, otherKey) else {
+            let message = "Focused groups 1 and 2 need different physical keys. Caps Lock and F17 also count as the same key."
+            focusGroupPhysicalKeyValidationMessage = message
+            statusMessage = message
+            return false
+        }
+
+        if number == 1 {
+            focusGroupOnePhysicalKey = key
+            persistPhysicalKey(key, key: Self.focusGroupOnePhysicalKeyDefaultsKey)
+        } else {
+            focusGroupTwoPhysicalKey = key
+            persistPhysicalKey(key, key: Self.focusGroupTwoPhysicalKeyDefaultsKey)
+        }
+
+        focusGroupPhysicalKeyValidationMessage = nil
+        statusMessage = "Focused group \(number) key saved as \(key.displayText)."
+        return true
+    }
+
+    func resetFocusGroupPhysicalKeys() {
+        focusGroupOnePhysicalKey = .groupOneDefault
+        focusGroupTwoPhysicalKey = .groupTwoDefault
+        persistPhysicalKey(.groupOneDefault, key: Self.focusGroupOnePhysicalKeyDefaultsKey)
+        persistPhysicalKey(.groupTwoDefault, key: Self.focusGroupTwoPhysicalKeyDefaultsKey)
+        focusGroupPhysicalKeyValidationMessage = nil
+        statusMessage = "Focused group keys reset to their defaults."
+    }
+
+    func toggleFocusGroups(reverse: Bool = false, number: Int = 1) {
+        guard focusGroupSwitchDelay > 0 else {
+            performFocusGroupSwitch(reverse: reverse, number: number)
+            return
+        }
+
+        pendingFocusGroupSwitchRequests.append(
+            FocusGroupSwitchRequest(reverse: reverse, number: number)
+        )
+        processNextFocusGroupSwitchIfNeeded()
+    }
+
+    private func processNextFocusGroupSwitchIfNeeded() {
+        guard pendingFocusGroupSwitchTask == nil,
+              !pendingFocusGroupSwitchRequests.isEmpty else {
+            return
+        }
+
+        let elapsedSinceLastSwitch = lastFocusGroupSwitchExecutionDate.map {
+            Date().timeIntervalSince($0)
+        } ?? focusGroupSwitchDelay
+        let remainingDelay = max(0, focusGroupSwitchDelay - elapsedSinceLastSwitch)
+
+        guard remainingDelay > 0 else {
+            performNextFocusGroupSwitch()
+            return
+        }
+
+        pendingFocusGroupSwitchTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: UInt64(remainingDelay * 1_000_000_000))
+            } catch {
+                return
+            }
+
+            guard let self, !Task.isCancelled else {
+                return
+            }
+
+            pendingFocusGroupSwitchTask = nil
+            performNextFocusGroupSwitch()
+        }
+    }
+
+    private func performNextFocusGroupSwitch() {
+        guard !pendingFocusGroupSwitchRequests.isEmpty else {
+            return
+        }
+
+        let request = pendingFocusGroupSwitchRequests.removeFirst()
+        lastFocusGroupSwitchExecutionDate = Date()
+        performFocusGroupSwitch(reverse: request.reverse, number: request.number)
+        processNextFocusGroupSwitchIfNeeded()
+    }
+
+    private func reschedulePendingFocusGroupSwitchIfNeeded() {
+        guard pendingFocusGroupSwitchTask != nil else {
+            return
+        }
+
+        pendingFocusGroupSwitchTask?.cancel()
+        pendingFocusGroupSwitchTask = nil
+        processNextFocusGroupSwitchIfNeeded()
+    }
+
+    private func performFocusGroupSwitch(reverse: Bool, number: Int) {
+        let focusGroupIdentifiers = focusGroupIdentifiers(number: number)
         guard !focusGroupIdentifiers.isEmpty else {
             statusMessage = "Choose focus groups before switching."
             return
         }
 
-        let runningFocusGroupIdentifiers = runningConfiguredFocusGroupIdentifiers()
+        let runningFocusGroupIdentifiers = runningConfiguredFocusGroupIdentifiers(number: number)
         guard !runningFocusGroupIdentifiers.isEmpty else {
             statusMessage = "No focus group apps are running."
             return
         }
 
-        let frontmostGroupIdentifier = frontmostFocusGroupIdentifier()
-        let currentGroupIdentifier = frontmostGroupIdentifier ?? activeFocusGroupIdentifier
+        let frontmostGroupIdentifier = frontmostFocusGroupIdentifier(number: number)
+        let storedActiveGroupIdentifier = activeFocusGroupIdentifier(number: number)
+        let currentGroupIdentifier = focusGroupTransitionIsInFlight(number: number) ?
+            storedActiveGroupIdentifier :
+            (frontmostGroupIdentifier ?? storedActiveGroupIdentifier)
+        let isSwitchingFocusGroupNumber = frontmostGroupIdentifier == nil &&
+            lastCycledFocusGroupNumber != nil &&
+            lastCycledFocusGroupNumber != number
         let targetGroupIdentifier: Int
         if runningFocusGroupIdentifiers.count == 1 {
             let groupIdentifier = runningFocusGroupIdentifiers[0]
-            if currentGroupIdentifier == groupIdentifier {
-                hideFocusGroup(groupIdentifier)
+            if currentGroupIdentifier == groupIdentifier, !isSwitchingFocusGroupNumber {
+                if switchesAwayFromSingleAppFocusGroups,
+                   (autoTileAppBundleIdentifiersByGroup[groupIdentifier] ?? []).count == 1,
+                   switchToOtherRunningFocusGroup(from: groupIdentifier,
+                                                  currentNumber: number,
+                                                  reverse: reverse) {
+                    return
+                }
+
+                hideFocusGroup(groupIdentifier, number: number)
+                lastCycledFocusGroupNumber = number
                 return
             }
 
-            revealFocusGroup(groupIdentifier)
+            revealFocusGroup(groupIdentifier, number: number)
+            lastCycledFocusGroupNumber = number
             return
         } else {
-            let activeIndex = currentGroupIdentifier.flatMap { runningFocusGroupIdentifiers.firstIndex(of: $0) }
-            let nextIndex = activeIndex.map { ($0 + 1) % runningFocusGroupIdentifiers.count } ?? 0
-            targetGroupIdentifier = runningFocusGroupIdentifiers[nextIndex]
+            if isSwitchingFocusGroupNumber,
+               let currentGroupIdentifier,
+               runningFocusGroupIdentifiers.contains(currentGroupIdentifier) {
+                targetGroupIdentifier = currentGroupIdentifier
+            } else {
+                let activeIndex = currentGroupIdentifier.flatMap { runningFocusGroupIdentifiers.firstIndex(of: $0) }
+                let nextIndex = activeIndex.map {
+                    reverse ?
+                        ($0 - 1 + runningFocusGroupIdentifiers.count) % runningFocusGroupIdentifiers.count :
+                        ($0 + 1) % runningFocusGroupIdentifiers.count
+                } ?? (reverse ? runningFocusGroupIdentifiers.count - 1 : 0)
+                targetGroupIdentifier = runningFocusGroupIdentifiers[nextIndex]
+            }
         }
 
-        activateFocusGroup(targetGroupIdentifier)
+        activateFocusGroup(targetGroupIdentifier, number: number)
+        lastCycledFocusGroupNumber = number
+    }
+
+    @discardableResult
+    private func switchToOtherRunningFocusGroup(from sourceGroupIdentifier: Int,
+                                                currentNumber: Int,
+                                                reverse: Bool) -> Bool {
+        let otherNumber = currentNumber == 1 ? 2 : 1
+        let otherGroupIdentifiers = runningConfiguredFocusGroupIdentifiers(number: otherNumber)
+            .filter { $0 != sourceGroupIdentifier }
+        guard !otherGroupIdentifiers.isEmpty else {
+            return false
+        }
+
+        let storedActiveGroupIdentifier = activeFocusGroupIdentifier(number: otherNumber)
+        let targetGroupIdentifier: Int
+        if let storedActiveGroupIdentifier,
+           otherGroupIdentifiers.contains(storedActiveGroupIdentifier) {
+            targetGroupIdentifier = storedActiveGroupIdentifier
+        } else {
+            targetGroupIdentifier = reverse ?
+                (otherGroupIdentifiers.last ?? otherGroupIdentifiers[0]) :
+                otherGroupIdentifiers[0]
+        }
+
+        activateFocusGroup(targetGroupIdentifier, number: otherNumber)
+        lastCycledFocusGroupNumber = otherNumber
+        return true
     }
 
     func setAutoTileAppIsMain(_ isMain: Bool, app: AutoTileAppSelection, in group: AutoTileAppGroup) {
@@ -766,6 +1129,8 @@ final class WindowBuddyModel: ObservableObject {
 
         if !autoTiler.isRunning {
             autoTiler.start()
+        } else {
+            autoTiler.reconcileVisibleWindows()
         }
     }
 
@@ -807,10 +1172,19 @@ final class WindowBuddyModel: ObservableObject {
                                                                                                     appGroups: autoTileAppBundleIdentifiersByGroup)
         focusGroupIdentifiers = Self.normalizedFocusGroupIdentifiers(focusGroupIdentifiers,
                                                                      appGroups: autoTileAppBundleIdentifiersByGroup)
+        focusedGroupNumberByGroup = Self.normalizedFocusedGroupNumberByGroup(focusedGroupNumberByGroup,
+                                                                             appGroups: autoTileAppBundleIdentifiersByGroup)
+        focusGroupIdentifiers = Self.focusGroupIdentifiers(in: focusedGroupNumberByGroup, number: 1)
         if let activeFocusGroupIdentifier,
            !focusGroupIdentifiers.contains(activeFocusGroupIdentifier) {
             self.activeFocusGroupIdentifier = nil
             userDefaults.removeObject(forKey: Self.activeFocusGroupIdentifierDefaultsKey)
+        }
+        let secondaryFocusGroupIdentifiers = Self.focusGroupIdentifiers(in: focusedGroupNumberByGroup, number: 2)
+        if let activeSecondaryFocusGroupIdentifier,
+           !secondaryFocusGroupIdentifiers.contains(activeSecondaryFocusGroupIdentifier) {
+            self.activeSecondaryFocusGroupIdentifier = nil
+            userDefaults.removeObject(forKey: Self.activeSecondaryFocusGroupIdentifierDefaultsKey)
         }
         autoTileAppGroups = Self.appGroups(for: autoTileAppBundleIdentifiersByGroup,
                                            mainAppBundleIdentifiersByGroup: mainAppBundleIdentifiersByGroup,
@@ -834,6 +1208,8 @@ final class WindowBuddyModel: ObservableObject {
                          forKey: Self.focusTileWiderResizableBundleIdentifiersDefaultsKey)
         userDefaults.set(focusGroupIdentifiers,
                          forKey: Self.focusGroupIdentifiersDefaultsKey)
+        userDefaults.set(Self.persistedFocusedGroupNumberByGroup(focusedGroupNumberByGroup),
+                         forKey: Self.focusedGroupNumberByGroupDefaultsKey)
         userDefaults.removeObject(forKey: Self.autoTileAppBundleIdentifiersDefaultsKey)
         autoTiler.appGroupIdentifiersByBundleIdentifier = autoTileAppGroupIdentifiersByBundleIdentifier
         autoTiler.appBundleIdentifiersByGroup = autoTileAppBundleIdentifierOrderByGroup
@@ -874,37 +1250,62 @@ final class WindowBuddyModel: ObservableObject {
     }
 
     private func setFocusGroupIdentifiers(_ identifiers: [Int]) {
-        focusGroupIdentifiers = Self.normalizedFocusGroupIdentifiers(identifiers,
-                                                                    appGroups: autoTileAppBundleIdentifiersByGroup)
+        var numbers = focusedGroupNumberByGroup.compactMapValues { number in
+            number == 1 ? nil : number == 3 ? 2 : number
+        }
+        for identifier in Self.normalizedFocusGroupIdentifiers(identifiers, appGroups: autoTileAppBundleIdentifiersByGroup) {
+            numbers[identifier] = numbers[identifier] == 2 ? 3 : 1
+        }
+        setFocusedGroupNumberByGroup(numbers)
+    }
+
+    private func setFocusedGroupNumberByGroup(_ numbers: [Int: Int]) {
+        focusedGroupNumberByGroup = Self.normalizedFocusedGroupNumberByGroup(numbers,
+                                                                             appGroups: autoTileAppBundleIdentifiersByGroup)
+        focusGroupIdentifiers = Self.focusGroupIdentifiers(in: focusedGroupNumberByGroup, number: 1)
         userDefaults.set(focusGroupIdentifiers,
                          forKey: Self.focusGroupIdentifiersDefaultsKey)
+        userDefaults.set(Self.persistedFocusedGroupNumberByGroup(focusedGroupNumberByGroup),
+                         forKey: Self.focusedGroupNumberByGroupDefaultsKey)
 
         if let activeFocusGroupIdentifier,
            !focusGroupIdentifiers.contains(activeFocusGroupIdentifier) {
             self.activeFocusGroupIdentifier = nil
             userDefaults.removeObject(forKey: Self.activeFocusGroupIdentifierDefaultsKey)
         }
+        let secondaryFocusGroupIdentifiers = Self.focusGroupIdentifiers(in: focusedGroupNumberByGroup, number: 2)
+        if let activeSecondaryFocusGroupIdentifier,
+           !secondaryFocusGroupIdentifiers.contains(activeSecondaryFocusGroupIdentifier) {
+            self.activeSecondaryFocusGroupIdentifier = nil
+            userDefaults.removeObject(forKey: Self.activeSecondaryFocusGroupIdentifierDefaultsKey)
+        }
     }
 
-    private func hideFocusGroup(_ groupIdentifier: Int) {
+    private func hideFocusGroup(_ groupIdentifier: Int, number: Int) {
         let bundleIdentifiers = autoTileAppBundleIdentifiersByGroup[groupIdentifier] ?? []
         guard !bundleIdentifiers.isEmpty else {
             statusMessage = "Group \(groupIdentifier + 1) has no apps to hide."
             return
         }
 
-        autoTiler.suppressFocusGroupSwitchHideNotifications(for: bundleIdentifiers)
-        let hiddenApplicationCount = mover.hideApplications(bundleIdentifiers: bundleIdentifiers).count
-        activeFocusGroupIdentifier = nil
-        userDefaults.removeObject(forKey: Self.activeFocusGroupIdentifierDefaultsKey)
+        let runningApplications = NSWorkspace.shared.runningApplications
+        let processIdentifiers = mover.applicationProcessIdentifiers(bundleIdentifiers: bundleIdentifiers,
+                                                                      hidden: false,
+                                                                      runningApplications: runningApplications)
+
+        autoTiler.beginFocusGroupSwitch(settlesGroupIdentifier: nil)
+        autoTiler.suppressFocusGroupSwitchHideNotifications(for: processIdentifiers)
+        let hiddenApplicationCount = mover.setApplications(processIdentifiers, hidden: true)
+        setActiveFocusGroupIdentifier(nil, number: number)
+        markFocusGroupTransition(number: number)
 
         statusMessage = hiddenApplicationCount > 0 ?
             "Hid Group \(groupIdentifier + 1)." :
             "Group \(groupIdentifier + 1) is already hidden."
     }
 
-    private func activateFocusGroup(_ groupIdentifier: Int) {
-        guard focusGroupIdentifiers.contains(groupIdentifier) else {
+    private func activateFocusGroup(_ groupIdentifier: Int, number: Int) {
+        guard focusGroupNumber(for: groupIdentifier) != nil else {
             statusMessage = "Choose focus groups before switching."
             return
         }
@@ -915,40 +1316,56 @@ final class WindowBuddyModel: ObservableObject {
             return
         }
 
-        guard focusGroupIsRunning(groupIdentifier) else {
+        let runningApplications = NSWorkspace.shared.runningApplications
+        guard runningApplications.contains(where: { application in
+            application.activationPolicy == .regular &&
+                application.bundleIdentifier.map(targetBundleIdentifiers.contains) == true
+        }) else {
             statusMessage = "Group \(groupIdentifier + 1) has no running apps."
             return
         }
 
         let preferredActivationBundleIdentifiers = preferredActivationBundleIdentifiers(for: groupIdentifier)
-        let activatedApplicationCount = mover.revealApplications(
-            bundleIdentifiers: targetBundleIdentifiers,
-            preferredActivationBundleIdentifiers: preferredActivationBundleIdentifiers
+        let outsideBundleIdentifiers = bundleIdentifiersOutsideFocusGroup(
+            groupIdentifier,
+            runningApplications: runningApplications
         )
-        let outsideBundleIdentifiers = bundleIdentifiersOutsideFocusGroup(groupIdentifier)
-        if focusGroupSwitchingHidesOthers {
-            autoTiler.suppressFocusGroupSwitchHideNotifications(for: outsideBundleIdentifiers)
-        }
-        let hiddenApplicationCount = focusGroupSwitchingHidesOthers ?
-            mover.hideApplications(bundleIdentifiers: outsideBundleIdentifiers).count :
-            0
-        let revealedApplicationCount = retileFocusGroup(groupIdentifier)
+        let targetProcessIdentifiers = mover.applicationProcessIdentifiers(bundleIdentifiers: targetBundleIdentifiers,
+                                                                            hidden: true,
+                                                                            runningApplications: runningApplications)
+        let outsideProcessIdentifiers = focusGroupSwitchingHidesOthers ?
+            mover.applicationProcessIdentifiers(bundleIdentifiers: outsideBundleIdentifiers,
+                                                hidden: false,
+                                                runningApplications: runningApplications) :
+            []
 
-        activeFocusGroupIdentifier = groupIdentifier
-        userDefaults.set(groupIdentifier,
-                         forKey: Self.activeFocusGroupIdentifierDefaultsKey)
+        autoTiler.beginFocusGroupSwitch(settlesGroupIdentifier: groupIdentifier)
+        autoTiler.suppressFocusGroupSwitchUnhideNotifications(for: targetProcessIdentifiers)
+        autoTiler.suppressFocusGroupSwitchHideNotifications(for: outsideProcessIdentifiers)
 
-        if revealedApplicationCount > 0 || activatedApplicationCount > 0, hiddenApplicationCount > 0 {
+        let unhiddenApplicationCount = mover.setApplications(targetProcessIdentifiers, hidden: false)
+        let didActivateApplication = mover.activateApplication(
+            bundleIdentifiers: targetBundleIdentifiers,
+            preferredBundleIdentifiers: preferredActivationBundleIdentifiers,
+            runningApplications: runningApplications
+        )
+        let hiddenApplicationCount = mover.setApplications(outsideProcessIdentifiers, hidden: true)
+        autoTiler.scheduleFocusGroupRetiles(groupIdentifier)
+
+        setActiveFocusGroupIdentifier(groupIdentifier, number: number)
+        markFocusGroupTransition(number: number)
+
+        if unhiddenApplicationCount > 0 || didActivateApplication, hiddenApplicationCount > 0 {
             statusMessage = "Switched to Group \(groupIdentifier + 1)."
-        } else if revealedApplicationCount > 0 || activatedApplicationCount > 0 {
+        } else if unhiddenApplicationCount > 0 || didActivateApplication {
             statusMessage = "Revealed Group \(groupIdentifier + 1)."
         } else {
             statusMessage = "Group \(groupIdentifier + 1) is already visible."
         }
     }
 
-    private func revealFocusGroup(_ groupIdentifier: Int) {
-        guard focusGroupIdentifiers.contains(groupIdentifier) else {
+    private func revealFocusGroup(_ groupIdentifier: Int, number: Int) {
+        guard focusGroupNumber(for: groupIdentifier) != nil else {
             statusMessage = "Choose focus groups before switching."
             return
         }
@@ -959,67 +1376,108 @@ final class WindowBuddyModel: ObservableObject {
             return
         }
 
-        guard focusGroupIsRunning(groupIdentifier) else {
+        let runningApplications = NSWorkspace.shared.runningApplications
+        guard runningApplications.contains(where: { application in
+            application.activationPolicy == .regular &&
+                application.bundleIdentifier.map(targetBundleIdentifiers.contains) == true
+        }) else {
             statusMessage = "Group \(groupIdentifier + 1) has no running apps."
             return
         }
 
         let preferredActivationBundleIdentifiers = preferredActivationBundleIdentifiers(for: groupIdentifier)
-        let revealedApplicationCount = revealAndTileFocusGroup(groupIdentifier,
-                                                               bundleIdentifiers: targetBundleIdentifiers,
-                                                               preferredActivationBundleIdentifiers: preferredActivationBundleIdentifiers)
-        let activatedApplicationCount = mover.revealApplications(
+        let targetProcessIdentifiers = mover.applicationProcessIdentifiers(bundleIdentifiers: targetBundleIdentifiers,
+                                                                            hidden: true,
+                                                                            runningApplications: runningApplications)
+        autoTiler.beginFocusGroupSwitch(settlesGroupIdentifier: groupIdentifier)
+        autoTiler.suppressFocusGroupSwitchUnhideNotifications(for: targetProcessIdentifiers)
+        let unhiddenApplicationCount = mover.setApplications(targetProcessIdentifiers, hidden: false)
+        let didActivateApplication = mover.activateApplication(
             bundleIdentifiers: targetBundleIdentifiers,
-            preferredActivationBundleIdentifiers: preferredActivationBundleIdentifiers
+            preferredBundleIdentifiers: preferredActivationBundleIdentifiers,
+            runningApplications: runningApplications
         )
+        autoTiler.scheduleFocusGroupRetiles(groupIdentifier)
 
-        activeFocusGroupIdentifier = groupIdentifier
-        userDefaults.set(groupIdentifier,
-                         forKey: Self.activeFocusGroupIdentifierDefaultsKey)
+        setActiveFocusGroupIdentifier(groupIdentifier, number: number)
+        markFocusGroupTransition(number: number)
 
-        statusMessage = revealedApplicationCount > 0 || activatedApplicationCount > 0 ?
+        statusMessage = unhiddenApplicationCount > 0 || didActivateApplication ?
             "Revealed Group \(groupIdentifier + 1)." :
             "Group \(groupIdentifier + 1) is already visible."
     }
 
-    private func revealAndTileFocusGroup(_ groupIdentifier: Int,
-                                         bundleIdentifiers: Set<String>,
-                                         preferredActivationBundleIdentifiers: [String]) -> Int {
-        let revealedApplicationCount = mover.revealApplications(
-            bundleIdentifiers: bundleIdentifiers,
-            preferredActivationBundleIdentifiers: preferredActivationBundleIdentifiers,
-            activates: false
-        )
+    private func focusGroupTransitionIsInFlight(number: Int) -> Bool {
+        guard let deadline = focusGroupTransitionDeadlineByNumber[number] else {
+            return false
+        }
 
-        _ = retileFocusGroup(groupIdentifier)
+        guard deadline > Date() else {
+            focusGroupTransitionDeadlineByNumber.removeValue(forKey: number)
+            return false
+        }
 
-        return revealedApplicationCount
+        return true
     }
 
-    private func retileFocusGroup(_ groupIdentifier: Int) -> Int {
-        do {
-            let result = try autoTiler.retileVisibleGroup(groupIdentifier)
-            autoTiler.scheduleFocusGroupRetiles(groupIdentifier)
-            return result.tiledWindowCount
-        } catch {
-            if isAutoTilingEnabled {
-                statusMessage = error.localizedDescription
+    private func markFocusGroupTransition(number: Int) {
+        focusGroupTransitionDeadlineByNumber[number] = Date().addingTimeInterval(0.5)
+    }
+
+    private func runningConfiguredFocusGroupIdentifiers(number: Int) -> [Int] {
+        let runningBundleIdentifiers = Set(NSWorkspace.shared.runningApplications.compactMap { application -> String? in
+            guard application.activationPolicy == .regular else {
+                return nil
             }
-            return 0
+
+            return application.bundleIdentifier
+        })
+
+        return focusGroupIdentifiers(number: number).filter { groupIdentifier in
+            let bundleIdentifiers = autoTileAppBundleIdentifiersByGroup[groupIdentifier] ?? []
+            return !bundleIdentifiers.isDisjoint(with: runningBundleIdentifiers)
         }
     }
 
-    private func runningConfiguredFocusGroupIdentifiers() -> [Int] {
-        focusGroupIdentifiers.filter(focusGroupIsRunning)
+    private func focusGroupIdentifiers(number: Int) -> [Int] {
+        Self.focusGroupIdentifiers(in: focusedGroupNumberByGroup, number: number)
     }
 
-    private func frontmostFocusGroupIdentifier() -> Int? {
+    private func focusGroupNumber(for groupIdentifier: Int) -> Int? {
+        focusedGroupNumberByGroup[groupIdentifier]
+    }
+
+    private func activeFocusGroupIdentifier(number: Int) -> Int? {
+        number == 2 ? activeSecondaryFocusGroupIdentifier : activeFocusGroupIdentifier
+    }
+
+    private func setActiveFocusGroupIdentifier(_ groupIdentifier: Int?, number: Int) {
+        let key = number == 2 ?
+            Self.activeSecondaryFocusGroupIdentifierDefaultsKey :
+            Self.activeFocusGroupIdentifierDefaultsKey
+
+        if number == 2 {
+            activeSecondaryFocusGroupIdentifier = groupIdentifier
+        } else {
+            activeFocusGroupIdentifier = groupIdentifier
+        }
+
+        if let groupIdentifier {
+            userDefaults.set(groupIdentifier, forKey: key)
+        } else {
+            userDefaults.removeObject(forKey: key)
+        }
+    }
+
+    private func frontmostFocusGroupIdentifier(number: Int) -> Int? {
         guard let bundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
               let groupIdentifiers = autoTileAppGroupIdentifiersByBundleIdentifier[bundleIdentifier] else {
             return nil
         }
 
-        return focusGroupIdentifiers.first { groupIdentifiers.contains($0) }
+        return focusGroupIdentifiers(number: number).first {
+            groupIdentifiers.contains($0)
+        }
     }
 
     private func preferredActivationBundleIdentifiers(for groupIdentifier: Int) -> [String] {
@@ -1034,11 +1492,14 @@ final class WindowBuddyModel: ObservableObject {
         }
     }
 
-    private func bundleIdentifiersOutsideFocusGroup(_ groupIdentifier: Int) -> Set<String> {
+    private func bundleIdentifiersOutsideFocusGroup(
+        _ groupIdentifier: Int,
+        runningApplications: [NSRunningApplication]
+    ) -> Set<String> {
         let targetBundleIdentifiers = autoTileAppBundleIdentifiersByGroup[groupIdentifier] ?? []
         let ownBundleIdentifier = Bundle.main.bundleIdentifier
 
-        return Set(NSWorkspace.shared.runningApplications.compactMap { application -> String? in
+        return Set(runningApplications.compactMap { application -> String? in
             guard application.activationPolicy == .regular,
                   let bundleIdentifier = application.bundleIdentifier,
                   bundleIdentifier != ownBundleIdentifier,
@@ -1048,22 +1509,6 @@ final class WindowBuddyModel: ObservableObject {
 
             return bundleIdentifier
         })
-    }
-
-    private func focusGroupIsRunning(_ groupIdentifier: Int) -> Bool {
-        let bundleIdentifiers = autoTileAppBundleIdentifiersByGroup[groupIdentifier] ?? []
-        guard !bundleIdentifiers.isEmpty else {
-            return false
-        }
-
-        let runningBundleIdentifiers = Set(NSWorkspace.shared.runningApplications.compactMap { application -> String? in
-            guard application.activationPolicy == .regular else {
-                return nil
-            }
-
-            return application.bundleIdentifier
-        })
-        return !bundleIdentifiers.isDisjoint(with: runningBundleIdentifiers)
     }
 
     private static func appGroups(for groups: [Int: Set<String>],
@@ -1164,13 +1609,39 @@ final class WindowBuddyModel: ObservableObject {
                                         appGroups: appGroups)
     }
 
+    private static func storedFocusedGroupNumberByGroup(in userDefaults: UserDefaults,
+                                                        appGroups: [Int: Set<String>],
+                                                        legacyFocusGroupIdentifiers: [Int]) -> [Int: Int] {
+        if let storedSettings = userDefaults.dictionary(forKey: focusedGroupNumberByGroupDefaultsKey) as? [String: Int] {
+            return normalizedFocusedGroupNumberByGroup(Dictionary(uniqueKeysWithValues: storedSettings.compactMap { key, value in
+                guard let groupIndex = Int(key) else {
+                    return nil
+                }
+
+                return (groupIndex, value)
+            }), appGroups: appGroups)
+        }
+
+        return normalizedFocusedGroupNumberByGroup(Dictionary(uniqueKeysWithValues: legacyFocusGroupIdentifiers.map {
+            ($0, 1)
+        }), appGroups: appGroups)
+    }
+
     private static func storedActiveFocusGroupIdentifier(in userDefaults: UserDefaults,
                                                         focusGroupIdentifiers: [Int]) -> Int? {
-        guard userDefaults.object(forKey: activeFocusGroupIdentifierDefaultsKey) != nil else {
+        storedActiveFocusGroupIdentifier(in: userDefaults,
+                                         key: activeFocusGroupIdentifierDefaultsKey,
+                                         focusGroupIdentifiers: focusGroupIdentifiers)
+    }
+
+    private static func storedActiveFocusGroupIdentifier(in userDefaults: UserDefaults,
+                                                        key: String,
+                                                        focusGroupIdentifiers: [Int]) -> Int? {
+        guard userDefaults.object(forKey: key) != nil else {
             return nil
         }
 
-        let groupIdentifier = userDefaults.integer(forKey: activeFocusGroupIdentifierDefaultsKey)
+        let groupIdentifier = userDefaults.integer(forKey: key)
         return focusGroupIdentifiers.contains(groupIdentifier) ? groupIdentifier : nil
     }
 
@@ -1218,6 +1689,27 @@ final class WindowBuddyModel: ObservableObject {
                 !(appGroups[groupIdentifier] ?? []).isEmpty &&
                 seenIdentifiers.insert(groupIdentifier).inserted
         }
+    }
+
+    private static func normalizedFocusedGroupNumberByGroup(_ settings: [Int: Int],
+                                                            appGroups: [Int: Set<String>]) -> [Int: Int] {
+        Dictionary(uniqueKeysWithValues: settings.compactMap { groupIdentifier, number in
+            guard groupIdentifier >= 0,
+                  groupIdentifier < autoTileGroupCount,
+                  number == 1 || number == 2 || number == 3,
+                  !(appGroups[groupIdentifier] ?? []).isEmpty else {
+                return nil
+            }
+
+            return (groupIdentifier, number)
+        })
+    }
+
+    private static func focusGroupIdentifiers(in settings: [Int: Int], number: Int) -> [Int] {
+        settings
+            .filter { $0.value == number || $0.value == 3 }
+            .map(\.key)
+            .sorted()
     }
 
     private static func storedFillsFirstWindowByGroup(in userDefaults: UserDefaults) -> [Int: Bool] {
@@ -1368,9 +1860,58 @@ final class WindowBuddyModel: ObservableObject {
         "\(Int((widthFraction * 100).rounded()))%"
     }
 
+    private static func normalizedFocusGroupSwitchDelay(_ delay: Double) -> Double {
+        min(max(delay, focusGroupSwitchDelayRange.lowerBound),
+            focusGroupSwitchDelayRange.upperBound)
+    }
+
+    private static func focusGroupSwitchDelayText(for delay: Double) -> String {
+        delay == 0 ? "None" : "\(Int((delay * 1_000).rounded())) ms"
+    }
+
+    private static func storedShortcut(in userDefaults: UserDefaults,
+                                       key: String,
+                                       defaultShortcut: DockMoverShortcut) -> DockMoverShortcut {
+        guard let data = userDefaults.data(forKey: key),
+              let shortcut = try? JSONDecoder().decode(DockMoverShortcut.self, from: data) else {
+            return defaultShortcut
+        }
+
+        return shortcut
+    }
+
+    private func persistShortcut(_ shortcut: DockMoverShortcut, key: String) {
+        if let data = try? JSONEncoder().encode(shortcut) {
+            userDefaults.set(data, forKey: key)
+        }
+    }
+
+    private static func storedPhysicalKey(in userDefaults: UserDefaults,
+                                          key: String,
+                                          defaultKey: FocusGroupPhysicalKey) -> FocusGroupPhysicalKey {
+        guard let storedValue = userDefaults.object(forKey: key) as? NSNumber,
+              let keyCode = UInt16(exactly: storedValue.intValue),
+              let physicalKey = FocusGroupPhysicalKey(keyCode: keyCode) else {
+            return defaultKey
+        }
+
+        return physicalKey
+    }
+
+    private func persistPhysicalKey(_ physicalKey: FocusGroupPhysicalKey,
+                                    key: String) {
+        userDefaults.set(Int(physicalKey.keyCode), forKey: key)
+    }
+
     private static func persistedAppGroups(_ groups: [Int: Set<String>]) -> [String: [String]] {
         Dictionary(uniqueKeysWithValues: (0..<autoTileGroupCount).map { groupIndex in
             (String(groupIndex), Array(groups[groupIndex] ?? []).sorted())
+        })
+    }
+
+    private static func persistedFocusedGroupNumberByGroup(_ settings: [Int: Int]) -> [String: Int] {
+        Dictionary(uniqueKeysWithValues: settings.map { groupIndex, number in
+            (String(groupIndex), number)
         })
     }
 

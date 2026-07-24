@@ -57,6 +57,27 @@ struct AutoTileWindow {
     let window: AXUIElement
     let frame: CGRect
     let screenVisibleFrame: CGRect
+    let isNativeFullScreen: Bool
+
+    init(id: AutoTileWindowID,
+         applicationName: String,
+         bundleIdentifier: String,
+         title: String?,
+         processIdentifier: pid_t,
+         window: AXUIElement,
+         frame: CGRect,
+         screenVisibleFrame: CGRect,
+         isNativeFullScreen: Bool = false) {
+        self.id = id
+        self.applicationName = applicationName
+        self.bundleIdentifier = bundleIdentifier
+        self.title = title
+        self.processIdentifier = processIdentifier
+        self.window = window
+        self.frame = frame
+        self.screenVisibleFrame = screenVisibleFrame
+        self.isNativeFullScreen = isNativeFullScreen
+    }
 
     var area: CGFloat {
         max(0, frame.width) * max(0, frame.height)
@@ -292,6 +313,70 @@ final class AccessibilityWindowMover {
         }
     }
 
+    func applicationProcessIdentifiers(bundleIdentifiers: Set<String>,
+                                       hidden: Bool? = nil,
+                                       runningApplications: [NSRunningApplication]? = nil) -> Set<pid_t> {
+        guard !bundleIdentifiers.isEmpty else {
+            return []
+        }
+
+        let applications = runningApplications ?? NSWorkspace.shared.runningApplications
+        return applications.reduce(into: []) { processIdentifiers, application in
+            guard let bundleIdentifier = application.bundleIdentifier,
+                  bundleIdentifiers.contains(bundleIdentifier),
+                  application.activationPolicy == .regular,
+                  hidden.map({ application.isHidden == $0 }) ?? true else {
+                return
+            }
+
+            processIdentifiers.insert(application.processIdentifier)
+        }
+    }
+
+    @discardableResult
+    func activateApplication(bundleIdentifiers: Set<String>,
+                             preferredBundleIdentifiers: [String] = [],
+                             runningApplications: [NSRunningApplication]? = nil) -> Bool {
+        guard !bundleIdentifiers.isEmpty else {
+            return false
+        }
+
+        let applications = (runningApplications ?? NSWorkspace.shared.runningApplications).filter { application in
+            guard let bundleIdentifier = application.bundleIdentifier else {
+                return false
+            }
+
+            return bundleIdentifiers.contains(bundleIdentifier) &&
+                application.activationPolicy == .regular
+        }
+        let applicationsByBundleIdentifier = Dictionary(grouping: applications) { application in
+            application.bundleIdentifier ?? ""
+        }
+        let activationApplication = preferredBundleIdentifiers
+            .compactMap { applicationsByBundleIdentifier[$0]?.first }
+            .first ?? applications.first
+
+        return activationApplication?.activate(options: [.activateAllWindows]) ?? false
+    }
+
+    @discardableResult
+    func prepareHiddenApplicationsForAppLevelReveal(bundleIdentifiers: Set<String>) -> Int {
+        guard !bundleIdentifiers.isEmpty else {
+            return 0
+        }
+
+        return NSWorkspace.shared.runningApplications.reduce(0) { count, application in
+            guard let bundleIdentifier = application.bundleIdentifier,
+                  bundleIdentifiers.contains(bundleIdentifier),
+                  application.activationPolicy == .regular,
+                  application.isHidden else {
+                return count
+            }
+
+            return count + unminimizeWindows(for: application)
+        }
+    }
+
     func hideApplications(bundleIdentifiers: Set<String>) -> Set<String> {
         guard !bundleIdentifiers.isEmpty else {
             return []
@@ -301,16 +386,12 @@ final class AccessibilityWindowMover {
             guard let bundleIdentifier = application.bundleIdentifier,
                   bundleIdentifiers.contains(bundleIdentifier),
                   application.activationPolicy == .regular,
-                  !application.isHidden else {
+                  !application.isHidden,
+                  application.hide() else {
                 return
             }
 
-            let minimizedWindowCount = minimizeWindows(for: application)
-            let didHide = application.hide()
-
-            if didHide || minimizedWindowCount > 0 {
-                hiddenBundleIdentifiers.insert(bundleIdentifier)
-            }
+            hiddenBundleIdentifiers.insert(bundleIdentifier)
         }
     }
 
@@ -349,15 +430,26 @@ final class AccessibilityWindowMover {
         }
         var affectedBundleIdentifiers: Set<String> = []
 
+        // Send all application-level reveal requests back-to-back before doing
+        // any per-window restoration work. This keeps multi-app groups from
+        // appearing one application at a time.
         for application in applications {
             guard let bundleIdentifier = application.bundleIdentifier else {
                 continue
             }
 
             let didUnhide = application.unhide()
-            let unminimizedWindowCount = unminimizeWindows(for: application)
+            if didUnhide {
+                affectedBundleIdentifiers.insert(bundleIdentifier)
+            }
+        }
 
-            if didUnhide || unminimizedWindowCount > 0 {
+        for application in applications {
+            guard let bundleIdentifier = application.bundleIdentifier else {
+                continue
+            }
+
+            if unminimizeWindows(for: application) > 0 {
                 affectedBundleIdentifiers.insert(bundleIdentifier)
             }
         }
@@ -477,7 +569,9 @@ final class AccessibilityWindowMover {
                                       processIdentifier: processIdentifier,
                                       window: window,
                                       frame: frame,
-                                      screenVisibleFrame: screenVisibleFrame)
+                                      screenVisibleFrame: screenVisibleFrame,
+                                      isNativeFullScreen: booleanAttribute("AXFullScreen" as CFString,
+                                                                           for: window) ?? false)
             }
         }
     }
@@ -896,22 +990,6 @@ final class AccessibilityWindowMover {
         }
     }
 
-    private func minimizeWindows(for application: NSRunningApplication) -> Int {
-        let applicationElement = AXUIElementCreateApplication(application.processIdentifier)
-
-        return allWindows(for: applicationElement).reduce(0) { count, window in
-            guard isStandardWindow(window),
-                  !isMinimized(window) else {
-                return count
-            }
-
-            let error = AXUIElementSetAttributeValue(window,
-                                                     kAXMinimizedAttribute as CFString,
-                                                     kCFBooleanTrue)
-            return error == .success ? count + 1 : count
-        }
-    }
-
     private func isStandardWindow(_ window: AXUIElement) -> Bool {
         guard stringAttribute(kAXRoleAttribute as CFString, for: window) == (kAXWindowRole as String) else {
             return false
@@ -937,24 +1015,29 @@ final class AccessibilityWindowMover {
         return value as? String
     }
 
-    private func isMinimized(_ window: AXUIElement) -> Bool {
-        var minimizedValue: CFTypeRef?
-        let minimizedError = AXUIElementCopyAttributeValue(window,
-                                                          kAXMinimizedAttribute as CFString,
-                                                          &minimizedValue)
+    private func booleanAttribute(_ attribute: CFString, for element: AXUIElement) -> Bool? {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(element, attribute, &value)
 
-        guard minimizedError == .success,
-              let minimizedValue,
-              CFGetTypeID(minimizedValue) == CFBooleanGetTypeID() else {
-            return false
+        guard error == .success,
+              let value,
+              CFGetTypeID(value) == CFBooleanGetTypeID() else {
+            return nil
         }
 
-        let minimized = minimizedValue as! CFBoolean
-        return CFBooleanGetValue(minimized)
+        return CFBooleanGetValue((value as! CFBoolean))
+    }
+
+    private func isMinimized(_ window: AXUIElement) -> Bool {
+        booleanAttribute(kAXMinimizedAttribute as CFString, for: window) ?? false
     }
 
     func currentFrame(of window: AXUIElement) -> CGRect? {
         try? frame(of: window)
+    }
+
+    func visibleScreenFrame(containing windowFrame: CGRect) -> CGRect? {
+        visibleFrame(containing: windowFrame)
     }
 
     private func frame(of window: AXUIElement) throws -> CGRect {
@@ -1629,10 +1712,10 @@ final class AccessibilityWindowMover {
                 frame = frames[min(reservedSlot, frames.count - 1)]
             } else {
                 let canFillScreen = Self.isBrowserBundleIdentifier(window.bundleIdentifier)
-                if screenLayoutMode == .fullScreen {
+                if screenLayoutMode == .fullScreen ||
+                   screenLayoutMode == .verticalScreen {
                     frame = screenVisibleFrame
-                } else if screenLayoutMode.prioritizesFirstWindow ||
-                          screenLayoutMode == .verticalScreen {
+                } else if screenLayoutMode.prioritizesFirstWindow {
                     frame = splitPrimaryFrames(in: screenVisibleFrame,
                                                primaryFraction: screenLayoutMode.primaryFraction,
                                                direction: screenLayoutMode.splitDirection,
@@ -2208,6 +2291,11 @@ final class AccessibilityWindowMover {
                                            ignoredSecondWindowStartMode: AutoTileIgnoredSecondWindowStartMode) -> (assignments: [(window: AutoTileWindow, frame: CGRect)], skippedWindowCount: Int) {
         guard let originalWindow = windows.first else {
             return ([], 0)
+        }
+
+        if windows.count == 1,
+           splitDirection == .vertical {
+            return ([(window: originalWindow, frame: screenVisibleFrame)], 0)
         }
 
         let maximumWindowCount = Self.maximumAutoTileWindows(for: maximumColumnCount)

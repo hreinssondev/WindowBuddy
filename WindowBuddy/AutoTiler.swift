@@ -188,6 +188,21 @@ private struct TemporarilyRemovedAutoTileWindow {
     let groupIdentifiers: Set<Int>
 }
 
+private struct FocusGroupSwitchNotificationSuppression {
+    let token: UUID
+    let sequence: UInt64
+    let settlesGroupIdentifier: Int?
+}
+
+private struct AutoTileWindowAdjustmentKinds: OptionSet {
+    let rawValue: Int
+
+    static let moved = AutoTileWindowAdjustmentKinds(rawValue: 1 << 0)
+    static let resized = AutoTileWindowAdjustmentKinds(rawValue: 1 << 1)
+    static let userInitiatedMove = AutoTileWindowAdjustmentKinds(rawValue: 1 << 2)
+    static let windowManagerShortcut = AutoTileWindowAdjustmentKinds(rawValue: 1 << 3)
+}
+
 @MainActor
 final class AutoTiler {
     typealias Handler = (Result<AutoTileResult, Error>) -> Void
@@ -213,22 +228,32 @@ final class AutoTiler {
     private var pendingSettledRetileWorkItems: [DispatchWorkItem] = []
     private var pendingRetileReinforcementWorkItems: [DispatchWorkItem] = []
     private var pendingMainAppRetileWorkItems: [DispatchWorkItem] = []
-    private var pendingFocusGroupRetileWorkItems: [DispatchWorkItem] = []
+    private var pendingFocusGroupRetileWorkItemsByGroup: [Int: [DispatchWorkItem]] = [:]
+    private var pendingFocusGroupRefreshWorkItem: DispatchWorkItem?
     private var pendingForcedTileRestoreWorkItems: [DispatchWorkItem] = []
     private var lastOpeningContext: AutoTileOpeningContext?
     private var temporarilyRemovedWindowsByID: [AutoTileWindowID: TemporarilyRemovedAutoTileWindow] = [:]
     private var mostRecentlyTemporarilyRemovedWindowID: AutoTileWindowID?
     private var hiddenScreenRevealProcessIdentifiers: Set<pid_t> = []
     private var propagatedHiddenBundleIdentifiers: Set<String> = []
-    private var focusGroupSwitchHiddenBundleIdentifiers: Set<String> = []
+    private var focusGroupSwitchHiddenNotificationSuppressionsByProcessIdentifier: [pid_t: [FocusGroupSwitchNotificationSuppression]] = [:]
+    private var focusGroupSwitchUnhiddenNotificationSuppressionsByProcessIdentifier: [pid_t: [FocusGroupSwitchNotificationSuppression]] = [:]
+    private var focusGroupSwitchTransitionToken: UUID?
+    private var focusGroupSwitchSequence: UInt64 = 0
+    private var focusGroupSwitchSettlesGroupIdentifier: Int?
+    private var focusGroupRetileGenerationByGroup: [Int: UInt64] = [:]
     private var propagatedUnhiddenBundleIdentifiers: Set<String> = []
     private var manuallyAdjustedWindowIDs: Set<AutoTileWindowID> = []
+    private var fullSizeWindowIDs: Set<AutoTileWindowID> = []
     private var windowIDsPendingManualEvaluation: Set<AutoTileWindowID> = []
+    private var provisionallyExcludedWindowIDs: Set<AutoTileWindowID> = []
+    private var pendingAdjustmentKindsByWindowID: [AutoTileWindowID: AutoTileWindowAdjustmentKinds] = [:]
     private var pendingManualAdjustmentWorkItem: DispatchWorkItem?
     private var appliedFrameByWindowID: [AutoTileWindowID: CGRect] = [:]
     private var isApplyingTile = false
     private var isStarted = false
     private var workspaceObserverTokens: [NSObjectProtocol] = []
+    private var applicationObserverTokens: [NSObjectProtocol] = []
     private var observedApplicationsByProcessIdentifier: [pid_t: ObservedApplication] = [:]
     private var lastMainAppFocusReassertion: (bundleIdentifier: String, date: Date)?
     private let eventScanDelay: TimeInterval = 0.03
@@ -292,6 +317,47 @@ final class AutoTiler {
 
     var movesExistingAppWindowsToFocusedGroup: Bool
     var revealsActiveGroupApps: Bool
+
+    var excludesManuallyMovedWindowsFromAutoTiling: Bool {
+        didSet {
+            guard oldValue != excludesManuallyMovedWindowsFromAutoTiling else {
+                return
+            }
+
+            invalidateForcedTileLayout()
+            if !excludesManuallyMovedWindowsFromAutoTiling,
+               !keepsFullSizeWindowsOutOfAutoTiling,
+               !manuallyAdjustedWindowIDs.isEmpty {
+                manuallyAdjustedWindowIDs = []
+                reconcileVisibleWindows()
+            }
+        }
+    }
+
+    var keepsFullSizeWindowsOutOfAutoTiling: Bool {
+        didSet {
+            guard oldValue != keepsFullSizeWindowsOutOfAutoTiling else {
+                return
+            }
+
+            invalidateForcedTileLayout()
+            if keepsFullSizeWindowsOutOfAutoTiling {
+                refreshFullSizeWindowExclusionsAndRetile()
+            } else {
+                let hadFullSizeExclusions = !fullSizeWindowIDs.isEmpty
+                let clearsMoveCycleExclusions =
+                    !excludesManuallyMovedWindowsFromAutoTiling &&
+                    !manuallyAdjustedWindowIDs.isEmpty
+                fullSizeWindowIDs = []
+                if clearsMoveCycleExclusions {
+                    manuallyAdjustedWindowIDs = []
+                }
+                if hadFullSizeExclusions || clearsMoveCycleExclusions {
+                    reconcileVisibleWindows()
+                }
+            }
+        }
+    }
 
     var appGroupIdentifiersByBundleIdentifier: [String: Set<Int>] {
         didSet {
@@ -434,6 +500,8 @@ final class AutoTiler {
          focusedWindowPrimaryWidthFraction: CGFloat = 2.0 / 3.0,
          movesExistingAppWindowsToFocusedGroup: Bool = false,
          revealsActiveGroupApps: Bool = false,
+         excludesManuallyMovedWindowsFromAutoTiling: Bool = false,
+         keepsFullSizeWindowsOutOfAutoTiling: Bool = false,
          fillsFirstWindowByGroup: [Int: Bool],
          screenLayoutModeByGroup: [Int: AutoTileScreenLayoutMode] = [:],
          maximumColumnCountByGroup: [Int: Int] = [:],
@@ -452,6 +520,8 @@ final class AutoTiler {
         self.focusedWindowPrimaryWidthFraction = focusedWindowPrimaryWidthFraction
         self.movesExistingAppWindowsToFocusedGroup = movesExistingAppWindowsToFocusedGroup
         self.revealsActiveGroupApps = revealsActiveGroupApps
+        self.excludesManuallyMovedWindowsFromAutoTiling = excludesManuallyMovedWindowsFromAutoTiling
+        self.keepsFullSizeWindowsOutOfAutoTiling = keepsFullSizeWindowsOutOfAutoTiling
         self.fillsFirstWindowByGroup = fillsFirstWindowByGroup
         self.screenLayoutModeByGroup = screenLayoutModeByGroup
         self.maximumColumnCountByGroup = maximumColumnCountByGroup
@@ -478,9 +548,11 @@ final class AutoTiler {
         installWorkspaceObservers()
         refreshAccessibilityObservers()
         refreshKnownWindows()
+        captureAppliedFrames()
         scheduleFallbackScan()
         scheduleMainAppFocusWatch()
         scheduleFocusedWindowRetile()
+        scheduleSettledRetile()
     }
 
     private func scheduleFallbackScan() {
@@ -554,22 +626,33 @@ final class AutoTiler {
         pendingRetileReinforcementWorkItems = []
         pendingMainAppRetileWorkItems.forEach { $0.cancel() }
         pendingMainAppRetileWorkItems = []
-        pendingFocusGroupRetileWorkItems.forEach { $0.cancel() }
-        pendingFocusGroupRetileWorkItems = []
+        pendingFocusGroupRetileWorkItemsByGroup.values
+            .flatMap { $0 }
+            .forEach { $0.cancel() }
+        pendingFocusGroupRetileWorkItemsByGroup = [:]
+        pendingFocusGroupRefreshWorkItem?.cancel()
+        pendingFocusGroupRefreshWorkItem = nil
         pendingForcedTileRestoreWorkItems.forEach { $0.cancel() }
         pendingForcedTileRestoreWorkItems = []
         lastOpeningContext = nil
         temporarilyRemovedWindowsByID = [:]
         mostRecentlyTemporarilyRemovedWindowID = nil
         manuallyAdjustedWindowIDs = []
+        fullSizeWindowIDs = []
         windowIDsPendingManualEvaluation = []
+        provisionallyExcludedWindowIDs = []
+        pendingAdjustmentKindsByWindowID = [:]
         pendingManualAdjustmentWorkItem?.cancel()
         pendingManualAdjustmentWorkItem = nil
         appliedFrameByWindowID = [:]
         lastMainAppFocusReassertion = nil
         hiddenScreenRevealProcessIdentifiers = []
         propagatedHiddenBundleIdentifiers = []
-        focusGroupSwitchHiddenBundleIdentifiers = []
+        focusGroupSwitchHiddenNotificationSuppressionsByProcessIdentifier = [:]
+        focusGroupSwitchUnhiddenNotificationSuppressionsByProcessIdentifier = [:]
+        focusGroupSwitchTransitionToken = nil
+        focusGroupSwitchSettlesGroupIdentifier = nil
+        focusGroupRetileGenerationByGroup = [:]
         propagatedUnhiddenBundleIdentifiers = []
         isApplyingTile = false
     }
@@ -584,6 +667,16 @@ final class AutoTiler {
         } else {
             retileVisibleWindows()
         }
+    }
+
+    func reconcileVisibleWindows() {
+        guard isRunning,
+              !allowedBundleIdentifiers.isEmpty else {
+            return
+        }
+
+        refreshAccessibilityObservers()
+        scheduleSettledRetile()
     }
 
     func retileVisibleGroup(_ groupIdentifier: Int,
@@ -603,12 +696,14 @@ final class AutoTiler {
         let visibleWindows = try mover.visibleAutoTileWindows(allowedBundleIdentifiers: allowedBundleIdentifiers)
         refreshAccessibilityObservers(visibleWindows: visibleWindows)
         synchronizeTemporarilyRemovedWindows(with: visibleWindows)
+        _ = synchronizeFullSizeWindowExclusions(with: visibleWindows)
 
+        let allWindowIDs = Set(visibleWindows.map(\.id))
+        reconcileWindowGroupIdentifiers(for: visibleWindows,
+                                        newWindowIDs: allWindowIDs.subtracting(windowGroupIdentifiersByID.keys),
+                                        openingContext: lastOpeningContext)
         let windows = activeAutoTileWindows(from: visibleWindows)
         let windowIDs = Set(windows.map(\.id))
-        reconcileWindowGroupIdentifiers(for: windows,
-                                        newWindowIDs: windowIDs.subtracting(windowGroupIdentifiersByID.keys),
-                                        openingContext: lastOpeningContext)
 
         let groupWindows = windows.filter { groupIdentifiers(for: $0).contains(groupIdentifier) }
         guard !groupWindows.isEmpty else {
@@ -641,22 +736,21 @@ final class AutoTiler {
     }
 
     func scheduleFocusGroupRetiles(_ groupIdentifier: Int) {
-        pendingFocusGroupRetileWorkItems.forEach { $0.cancel() }
-        pendingFocusGroupRetileWorkItems = []
+        cancelFocusGroupRetiles(groupIdentifier)
+        let generation = (focusGroupRetileGenerationByGroup[groupIdentifier] ?? 0) &+ 1
+        focusGroupRetileGenerationByGroup[groupIdentifier] = generation
 
         guard isRunning,
               !keepsForcedTileLayoutStable else {
             return
         }
 
-        for delay in [0.08, 0.22, 0.5, 0.9] {
+        for delay in [0.04, 0.15, 0.35, 0.70, 1.20] {
             let workItem = DispatchWorkItem { [weak self] in
                 MainActor.assumeIsolated {
-                    guard let self else {
-                        return
-                    }
-
-                    guard !self.keepsForcedTileLayoutStable else {
+                    guard let self,
+                          self.focusGroupRetileGenerationByGroup[groupIdentifier] == generation,
+                          !self.keepsForcedTileLayoutStable else {
                         return
                     }
 
@@ -672,21 +766,101 @@ final class AutoTiler {
                 }
             }
 
-            pendingFocusGroupRetileWorkItems.append(workItem)
+            pendingFocusGroupRetileWorkItemsByGroup[groupIdentifier, default: []].append(workItem)
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
         }
     }
 
-    func suppressFocusGroupSwitchHideNotifications(for bundleIdentifiers: Set<String>) {
-        guard !bundleIdentifiers.isEmpty else {
+    func beginFocusGroupSwitch(settlesGroupIdentifier: Int?) {
+        // The two focus-group tracks can switch independently. Keep the other
+        // track's slow unhide retries alive while replacing this group's work.
+        cancelPendingRetiles(preservingFocusGroupRetiles: true)
+        if let settlesGroupIdentifier {
+            cancelFocusGroupRetiles(settlesGroupIdentifier)
+        }
+        focusGroupSwitchSequence &+= 1
+
+        let token = UUID()
+        focusGroupSwitchTransitionToken = token
+        focusGroupSwitchSettlesGroupIdentifier = settlesGroupIdentifier
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self,
+                      self.focusGroupSwitchTransitionToken == token else {
+                    return
+                }
+
+                self.focusGroupSwitchTransitionToken = nil
+                self.focusGroupSwitchSettlesGroupIdentifier = nil
+            }
+        }
+    }
+
+    func suppressFocusGroupSwitchHideNotifications(for processIdentifiers: Set<pid_t>) {
+        guard !processIdentifiers.isEmpty,
+              let token = focusGroupSwitchTransitionToken else {
             return
         }
 
-        focusGroupSwitchHiddenBundleIdentifiers.formUnion(bundleIdentifiers)
+        let suppression = FocusGroupSwitchNotificationSuppression(
+            token: token,
+            sequence: focusGroupSwitchSequence,
+            settlesGroupIdentifier: focusGroupSwitchSettlesGroupIdentifier
+        )
+        for processIdentifier in processIdentifiers {
+            focusGroupSwitchHiddenNotificationSuppressionsByProcessIdentifier[processIdentifier, default: []].append(suppression)
+        }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             MainActor.assumeIsolated {
-                self?.focusGroupSwitchHiddenBundleIdentifiers.subtract(bundleIdentifiers)
+                guard let self else {
+                    return
+                }
+
+                for processIdentifier in processIdentifiers {
+                    let remainingSuppressions = self.focusGroupSwitchHiddenNotificationSuppressionsByProcessIdentifier[processIdentifier]?
+                        .filter { $0.token != token } ?? []
+                    if remainingSuppressions.isEmpty {
+                        self.focusGroupSwitchHiddenNotificationSuppressionsByProcessIdentifier.removeValue(forKey: processIdentifier)
+                    } else {
+                        self.focusGroupSwitchHiddenNotificationSuppressionsByProcessIdentifier[processIdentifier] = remainingSuppressions
+                    }
+                }
+            }
+        }
+    }
+
+    func suppressFocusGroupSwitchUnhideNotifications(for processIdentifiers: Set<pid_t>) {
+        guard !processIdentifiers.isEmpty,
+              let token = focusGroupSwitchTransitionToken else {
+            return
+        }
+
+        let suppression = FocusGroupSwitchNotificationSuppression(
+            token: token,
+            sequence: focusGroupSwitchSequence,
+            settlesGroupIdentifier: focusGroupSwitchSettlesGroupIdentifier
+        )
+        for processIdentifier in processIdentifiers {
+            focusGroupSwitchUnhiddenNotificationSuppressionsByProcessIdentifier[processIdentifier, default: []].append(suppression)
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else {
+                    return
+                }
+
+                for processIdentifier in processIdentifiers {
+                    let remainingSuppressions = self.focusGroupSwitchUnhiddenNotificationSuppressionsByProcessIdentifier[processIdentifier]?
+                        .filter { $0.token != token } ?? []
+                    if remainingSuppressions.isEmpty {
+                        self.focusGroupSwitchUnhiddenNotificationSuppressionsByProcessIdentifier.removeValue(forKey: processIdentifier)
+                    } else {
+                        self.focusGroupSwitchUnhiddenNotificationSuppressionsByProcessIdentifier[processIdentifier] = remainingSuppressions
+                    }
+                }
             }
         }
     }
@@ -700,19 +874,21 @@ final class AutoTiler {
         }
 
         cancelPendingRetiles()
+        invalidateForcedTileLayout()
         clearFocusedPrimaryState()
-        keepsForcedTileLayoutStable = true
 
         let visibleWindows = try mover.visibleAutoTileWindows(allowedBundleIdentifiers: allowedBundleIdentifiers,
                                                               includesOffscreenWindows: true)
         refreshAccessibilityObservers(visibleWindows: visibleWindows)
         synchronizeTemporarilyRemovedWindows(with: visibleWindows)
+        _ = synchronizeFullSizeWindowExclusions(with: visibleWindows)
 
+        let allWindowIDs = Set(visibleWindows.map(\.id))
+        reconcileWindowGroupIdentifiers(for: visibleWindows,
+                                        newWindowIDs: allWindowIDs.subtracting(windowGroupIdentifiersByID.keys),
+                                        openingContext: lastOpeningContext)
         let windows = activeAutoTileWindows(from: visibleWindows)
         let windowIDs = Set(windows.map(\.id))
-        reconcileWindowGroupIdentifiers(for: windows,
-                                        newWindowIDs: windowIDs.subtracting(windowGroupIdentifiersByID.keys),
-                                        openingContext: lastOpeningContext)
         updateGroupWindowOrders(for: windows)
         lastOpeningContext = mover.frontmostAutoTileOpeningContext()
         let affectedScreenFrames = Dictionary(grouping: windows, by: { AutoTileScreenKey($0.screenVisibleFrame) })
@@ -735,7 +911,7 @@ final class AutoTiler {
 
         let result = try autoTileGroups(windows: windows,
                                         affectedScreenFrames: affectedScreenFrames)
-        captureForcedTileLayoutSnapshot()
+        keepsForcedTileLayoutStable = captureForcedTileLayoutSnapshot()
         return result
     }
 
@@ -765,6 +941,8 @@ final class AutoTiler {
     }
 
     func temporarilyRemoveFromTilingAndFill(_ target: WindowTarget) throws -> AutoTileTemporaryRemovalResult {
+        invalidateForcedTileLayout()
+        cancelPendingRetiles()
         let result = try mover.applyPreferredOpeningSize(target)
 
         guard isRunning,
@@ -778,22 +956,24 @@ final class AutoTiler {
 
         let focusedFallbackWindowID = AutoTileWindowID(processIdentifier: target.processIdentifier,
                                                        elementHash: Int(CFHash(target.window)))
-        cancelPendingRetiles()
 
         let windows = try mover.visibleAutoTileWindows(allowedBundleIdentifiers: allowedBundleIdentifiers)
         refreshAccessibilityObservers(visibleWindows: windows)
         synchronizeTemporarilyRemovedWindows(with: windows)
+        _ = synchronizeFullSizeWindowExclusions(with: windows,
+                                                detectsNewGeometryMatches: true)
 
+        let allWindowIDs = Set(windows.map(\.id))
+        reconcileWindowGroupIdentifiers(for: windows,
+                                        newWindowIDs: allWindowIDs.subtracting(windowGroupIdentifiersByID.keys),
+                                        openingContext: lastOpeningContext)
         var activeWindows = activeAutoTileWindows(from: windows)
         let activeWindowIDs = Set(activeWindows.map(\.id))
-        reconcileWindowGroupIdentifiers(for: activeWindows,
-                                        newWindowIDs: activeWindowIDs.subtracting(windowGroupIdentifiersByID.keys),
-                                        openingContext: lastOpeningContext)
         updateGroupWindowOrders(for: activeWindows)
 
         guard let focusedWindow = focusedWindow(matching: target,
                                                 fallbackID: focusedFallbackWindowID,
-                                                in: activeWindows) else {
+                                                in: windows) else {
             knownWindowsByID = Self.windowScreenFramesByID(windows)
             orderedWindowIDs = updatedWindowOrder(currentWindowIDs: activeWindowIDs,
                                                   windows: activeWindows)
@@ -823,6 +1003,9 @@ final class AutoTiler {
                                                                                           applicationName: focusedWindow.applicationName,
                                                                                           groupIdentifiers: groupIdentifiers)
         mostRecentlyTemporarilyRemovedWindowID = focusedWindow.id
+        manuallyAdjustedWindowIDs.remove(focusedWindow.id)
+        fullSizeWindowIDs.remove(focusedWindow.id)
+        provisionallyExcludedWindowIDs.remove(focusedWindow.id)
 
         for groupIdentifier in groupIdentifiers {
             if enlargedWindowIDsByGroup[groupIdentifier] == focusedWindow.id {
@@ -865,10 +1048,14 @@ final class AutoTiler {
             throw AutoTileTemporaryRemovalError.noRemovedWindowToRestore
         }
 
+        invalidateForcedTileLayout()
         cancelPendingRetiles()
 
         let windows = try mover.visibleAutoTileWindows(allowedBundleIdentifiers: allowedBundleIdentifiers)
         refreshAccessibilityObservers(visibleWindows: windows)
+        synchronizeTemporarilyRemovedWindows(with: windows)
+        _ = synchronizeFullSizeWindowExclusions(with: windows,
+                                                detectsNewGeometryMatches: true)
 
         guard let restoredWindow = temporarilyRemovedWindow(matching: removal, in: windows) else {
             temporarilyRemovedWindowsByID.removeValue(forKey: removalID)
@@ -876,25 +1063,22 @@ final class AutoTiler {
             throw AutoTileTemporaryRemovalError.noRemovedWindowToRestore
         }
 
-        temporarilyRemovedWindowsByID.removeValue(forKey: removalID)
-        temporarilyRemovedWindowsByID.removeValue(forKey: restoredWindow.id)
-        mostRecentlyTemporarilyRemovedWindowID = temporarilyRemovedWindowsByID.keys.first
-
-        var activeWindows = activeAutoTileWindows(from: windows)
-        let activeWindowIDs = Set(activeWindows.map(\.id))
-        reconcileWindowGroupIdentifiers(for: activeWindows,
-                                        newWindowIDs: activeWindowIDs.subtracting(windowGroupIdentifiersByID.keys),
+        let allWindowIDs = Set(windows.map(\.id))
+        reconcileWindowGroupIdentifiers(for: windows,
+                                        newWindowIDs: allWindowIDs.subtracting(windowGroupIdentifiersByID.keys),
                                         openingContext: lastOpeningContext)
+        var activeWindows = activeAutoTileWindows(from: windows)
+        if !activeWindows.contains(where: { $0.id == restoredWindow.id }) {
+            activeWindows.append(restoredWindow)
+        }
+
+        let activeWindowIDs = Set(activeWindows.map(\.id))
         updateGroupWindowOrders(for: activeWindows)
         rememberLeadingWindowSlots(from: activeWindows)
         orderedWindowIDs = updatedWindowOrder(currentWindowIDs: activeWindowIDs,
                                               windows: activeWindows)
         knownWindowsByID = Self.windowScreenFramesByID(windows)
         lastOpeningContext = mover.frontmostAutoTileOpeningContext()
-
-        if !activeWindows.contains(where: { $0.id == restoredWindow.id }) {
-            activeWindows.append(restoredWindow)
-        }
 
         let targetGroupIdentifiers = groupIdentifiers(for: restoredWindow).isEmpty ?
             removal.groupIdentifiers :
@@ -908,6 +1092,15 @@ final class AutoTiler {
         let retileResult = try autoTileGroups(windows: activeWindows,
                                               affectedScreenFrames: [restoredWindow.screenVisibleFrame],
                                               targetGroupIdentifiers: Array(targetGroupIdentifiers).sorted())
+
+        // Commit only after the retile succeeds so a transient Accessibility
+        // failure leaves Restore available for another attempt.
+        temporarilyRemovedWindowsByID.removeValue(forKey: removalID)
+        temporarilyRemovedWindowsByID.removeValue(forKey: restoredWindow.id)
+        mostRecentlyTemporarilyRemovedWindowID = temporarilyRemovedWindowsByID.keys.first
+        manuallyAdjustedWindowIDs.remove(restoredWindow.id)
+        fullSizeWindowIDs.remove(restoredWindow.id)
+        provisionallyExcludedWindowIDs.remove(restoredWindow.id)
 
         return AutoTileTemporaryRestoreResult(applicationName: removal.applicationName,
                                              retileResult: retileResult)
@@ -936,19 +1129,22 @@ final class AutoTiler {
         }
 
         cancelPendingRetiles()
-        keepsForcedTileLayoutStable = false
-        forcedTileFramesByWindowID = [:]
+        invalidateForcedTileLayout()
         manuallyAdjustedWindowIDs.remove(focusedFallbackWindowID)
+        fullSizeWindowIDs.remove(focusedFallbackWindowID)
+        provisionallyExcludedWindowIDs.remove(focusedFallbackWindowID)
 
         let visibleWindows = try mover.visibleAutoTileWindows(allowedBundleIdentifiers: allowedBundleIdentifiers)
         refreshAccessibilityObservers(visibleWindows: visibleWindows)
         synchronizeTemporarilyRemovedWindows(with: visibleWindows)
+        _ = synchronizeFullSizeWindowExclusions(with: visibleWindows)
 
+        let allWindowIDs = Set(visibleWindows.map(\.id))
+        reconcileWindowGroupIdentifiers(for: visibleWindows,
+                                        newWindowIDs: allWindowIDs.subtracting(windowGroupIdentifiersByID.keys),
+                                        openingContext: lastOpeningContext)
         var windows = activeAutoTileWindows(from: visibleWindows)
         let windowIDs = Set(windows.map(\.id))
-        reconcileWindowGroupIdentifiers(for: windows,
-                                        newWindowIDs: windowIDs.subtracting(windowGroupIdentifiersByID.keys),
-                                        openingContext: lastOpeningContext)
         updateGroupWindowOrders(for: windows)
 
         guard let focusedWindow = focusedWindow(matching: target,
@@ -970,7 +1166,8 @@ final class AutoTiler {
                                   processIdentifier: window.processIdentifier,
                                   window: window.window,
                                   frame: movedFrame,
-                                  screenVisibleFrame: window.screenVisibleFrame)
+                                  screenVisibleFrame: window.screenVisibleFrame,
+                                  isNativeFullScreen: window.isNativeFullScreen)
         }
 
         let focusedWindowID = focusedWindow.id
@@ -1026,12 +1223,13 @@ final class AutoTiler {
         let visibleWindows = try mover.visibleAutoTileWindows(allowedBundleIdentifiers: allowedBundleIdentifiers)
         refreshAccessibilityObservers(visibleWindows: visibleWindows)
         synchronizeTemporarilyRemovedWindows(with: visibleWindows)
+        _ = synchronizeFullSizeWindowExclusions(with: visibleWindows)
 
-        let windows = activeAutoTileWindows(from: visibleWindows)
-        let windowIDs = Set(windows.map(\.id))
-        reconcileWindowGroupIdentifiers(for: windows,
-                                        newWindowIDs: windowIDs.subtracting(windowGroupIdentifiersByID.keys),
+        let allWindowIDs = Set(visibleWindows.map(\.id))
+        reconcileWindowGroupIdentifiers(for: visibleWindows,
+                                        newWindowIDs: allWindowIDs.subtracting(windowGroupIdentifiersByID.keys),
                                         openingContext: lastOpeningContext)
+        let windows = activeAutoTileWindows(from: visibleWindows)
         updateGroupWindowOrders(for: windows)
 
         guard let focusedWindow = focusedWindow(matching: target,
@@ -1100,12 +1298,15 @@ final class AutoTiler {
             let visibleWindows = try mover.visibleAutoTileWindows(allowedBundleIdentifiers: allowedBundleIdentifiers)
             refreshAccessibilityObservers(visibleWindows: visibleWindows)
             synchronizeTemporarilyRemovedWindows(with: visibleWindows)
+            _ = synchronizeFullSizeWindowExclusions(with: visibleWindows,
+                                                    detectsNewGeometryMatches: true)
 
             let windows = activeAutoTileWindows(from: visibleWindows)
             let windowsByID = Self.windowScreenFramesByID(visibleWindows)
             let windowIDs = Set(windows.map(\.id))
-            reconcileWindowGroupIdentifiers(for: windows,
-                                            newWindowIDs: windowIDs.subtracting(windowGroupIdentifiersByID.keys),
+            let allWindowIDs = Set(visibleWindows.map(\.id))
+            reconcileWindowGroupIdentifiers(for: visibleWindows,
+                                            newWindowIDs: allWindowIDs.subtracting(windowGroupIdentifiersByID.keys),
                                             openingContext: lastOpeningContext)
             updateGroupWindowOrders(for: windows)
             knownWindowsByID = windowsByID
@@ -1136,13 +1337,15 @@ final class AutoTiler {
             let visibleWindows = try mover.visibleAutoTileWindows(allowedBundleIdentifiers: allowedBundleIdentifiers)
             refreshAccessibilityObservers(visibleWindows: visibleWindows)
             synchronizeTemporarilyRemovedWindows(with: visibleWindows)
+            _ = synchronizeFullSizeWindowExclusions(with: visibleWindows)
 
             let windows = activeAutoTileWindows(from: visibleWindows)
             let windowIDs = Set(windows.map(\.id))
             let previousWindowIDs = Set(knownWindowsByID.keys)
-            let didObserveWindowSetChange = windowIDs != previousWindowIDs
-            reconcileWindowGroupIdentifiers(for: windows,
-                                            newWindowIDs: windowIDs.subtracting(windowGroupIdentifiersByID.keys),
+            let allWindowIDs = Set(visibleWindows.map(\.id))
+            let didObserveWindowSetChange = allWindowIDs != previousWindowIDs
+            reconcileWindowGroupIdentifiers(for: visibleWindows,
+                                            newWindowIDs: allWindowIDs.subtracting(windowGroupIdentifiersByID.keys),
                                             openingContext: lastOpeningContext)
             updateGroupWindowOrders(for: windows)
             lastOpeningContext = mover.frontmostAutoTileOpeningContext()
@@ -1204,6 +1407,10 @@ final class AutoTiler {
             let visibleWindows = try mover.visibleAutoTileWindows(allowedBundleIdentifiers: allowedBundleIdentifiers)
             refreshAccessibilityObservers(visibleWindows: visibleWindows)
             synchronizeTemporarilyRemovedWindows(with: visibleWindows)
+            let didChangeFullSizeExclusions = synchronizeFullSizeWindowExclusions(
+                with: visibleWindows,
+                detectsNewGeometryMatches: true
+            )
 
             let windowsByID = Self.windowScreenFramesByID(visibleWindows)
             let allWindowIDs = Set(windowsByID.keys)
@@ -1211,29 +1418,39 @@ final class AutoTiler {
             let newWindowIDs = allWindowIDs.subtracting(knownWindowIDs)
             let closedWindowIDs = knownWindowIDs.subtracting(allWindowIDs)
             manuallyAdjustedWindowIDs.formIntersection(allWindowIDs)
-            let observedWindowChange = !newWindowIDs.isEmpty || !closedWindowIDs.isEmpty
+            fullSizeWindowIDs.formIntersection(allWindowIDs)
+            windowIDsPendingManualEvaluation.formIntersection(allWindowIDs)
+            provisionallyExcludedWindowIDs.formIntersection(allWindowIDs)
+            pendingAdjustmentKindsByWindowID = pendingAdjustmentKindsByWindowID.filter {
+                allWindowIDs.contains($0.key)
+            }
+            let observedWindowChange = !newWindowIDs.isEmpty ||
+                !closedWindowIDs.isEmpty ||
+                didChangeFullSizeExclusions
             if observedWindowChange {
-                keepsForcedTileLayoutStable = false
-                forcedTileFramesByWindowID = [:]
+                invalidateForcedTileLayout()
             }
 
             let windows = activeAutoTileWindows(from: visibleWindows)
             let windowIDs = Set(windows.map(\.id))
-            reconcileWindowGroupIdentifiers(for: windows,
-                                            newWindowIDs: newWindowIDs.intersection(windowIDs),
+            reconcileWindowGroupIdentifiers(for: visibleWindows,
+                                            newWindowIDs: newWindowIDs,
                                             openingContext: openingContext)
             updateGroupWindowOrders(for: windows)
             lastOpeningContext = mover.frontmostAutoTileOpeningContext()
-            let affectedScreenFrames = affectedScreenFrames(for: newWindowIDs,
+            var affectedScreenFrames = affectedScreenFrames(for: newWindowIDs,
                                                             closedWindowIDs: closedWindowIDs,
                                                             windows: visibleWindows)
+            if didChangeFullSizeExclusions {
+                affectedScreenFrames.append(contentsOf: visibleWindows.map(\.screenVisibleFrame))
+            }
             rememberLeadingWindowSlots(from: windows)
             orderedWindowIDs = updatedWindowOrder(currentWindowIDs: windowIDs,
                                                   windows: windows)
             knownWindowsByID = windowsByID
             activateMainAppsRelatedToNewWindows(newWindowIDs: newWindowIDs,
                                                 windows: visibleWindows)
-            let shouldScheduleSettledRetile = !newWindowIDs.isEmpty || !closedWindowIDs.isEmpty
+            let shouldScheduleSettledRetile = observedWindowChange
             let temporarilyNormalizedGroupIdentifiers = temporarilyNormalizedEnlargedGroupIdentifiers(forNewWindowIDs: newWindowIDs,
                                                                                                        closedWindowIDs: closedWindowIDs,
                                                                                                        previousWindowGroupIdentifiersByID: previousWindowGroupIdentifiersByID,
@@ -1283,9 +1500,9 @@ final class AutoTiler {
                     return
                 }
 
-                let bundleIdentifier = (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier
+                let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
                 Task { @MainActor in
-                    autoTiler.handleApplicationActivation(bundleIdentifier: bundleIdentifier)
+                    autoTiler.handleApplicationActivation(application: application)
                 }
             },
             notificationCenter.addObserver(forName: NSWorkspace.didLaunchApplicationNotification,
@@ -1318,9 +1535,9 @@ final class AutoTiler {
                     return
                 }
 
-                let bundleIdentifier = (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier
+                let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
                 Task { @MainActor in
-                    autoTiler.handleApplicationUnhide(bundleIdentifier: bundleIdentifier)
+                    autoTiler.handleApplicationUnhide(application: application)
                 }
             },
             notificationCenter.addObserver(forName: NSWorkspace.didHideApplicationNotification,
@@ -1330,14 +1547,62 @@ final class AutoTiler {
                     return
                 }
 
-                let bundleIdentifier = (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier
+                let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
                 Task { @MainActor in
-                    autoTiler.handleApplicationHide(bundleIdentifier: bundleIdentifier)
+                    autoTiler.handleApplicationHide(application: application)
                 }
             },
             notificationCenter.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification,
                                            object: nil,
                                            queue: .main) { [weak self] _ in
+                guard let autoTiler = self else {
+                    return
+                }
+
+                Task { @MainActor in
+                    autoTiler.handleWorkspaceChange()
+                }
+            },
+            notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification,
+                                           object: nil,
+                                           queue: .main) { [weak self] _ in
+                guard let autoTiler = self else {
+                    return
+                }
+
+                Task { @MainActor in
+                    autoTiler.handleWorkspaceChange()
+                }
+            },
+            notificationCenter.addObserver(forName: NSWorkspace.screensDidWakeNotification,
+                                           object: nil,
+                                           queue: .main) { [weak self] _ in
+                guard let autoTiler = self else {
+                    return
+                }
+
+                Task { @MainActor in
+                    autoTiler.handleWorkspaceChange()
+                }
+            },
+            notificationCenter.addObserver(forName: NSWorkspace.sessionDidBecomeActiveNotification,
+                                           object: nil,
+                                           queue: .main) { [weak self] _ in
+                guard let autoTiler = self else {
+                    return
+                }
+
+                Task { @MainActor in
+                    autoTiler.handleWorkspaceChange()
+                }
+            }
+        ]
+
+        let applicationNotificationCenter = NotificationCenter.default
+        applicationObserverTokens = [
+            applicationNotificationCenter.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                      object: nil,
+                                                      queue: .main) { [weak self] _ in
                 guard let autoTiler = self else {
                     return
                 }
@@ -1357,6 +1622,12 @@ final class AutoTiler {
         }
 
         workspaceObserverTokens = []
+
+        let applicationNotificationCenter = NotificationCenter.default
+        for token in applicationObserverTokens {
+            applicationNotificationCenter.removeObserver(token)
+        }
+        applicationObserverTokens = []
     }
 
     private func handleWorkspaceChange() {
@@ -1366,6 +1637,7 @@ final class AutoTiler {
 
         refreshAccessibilityObservers()
         scheduleEventScan()
+        scheduleSettledRetile()
     }
 
     private func handleApplicationLaunch(bundleIdentifier: String?) {
@@ -1382,14 +1654,22 @@ final class AutoTiler {
         handleWorkspaceChange()
     }
 
-    private func handleApplicationActivation(bundleIdentifier: String?) {
+    private func handleApplicationActivation(application: NSRunningApplication?) {
         guard isRunning,
-              let bundleIdentifier,
+              let application,
+              let bundleIdentifier = application.bundleIdentifier,
               bundleIdentifier != Bundle.main.bundleIdentifier else {
             return
         }
 
         guard allowedBundleIdentifiers.contains(bundleIdentifier) else {
+            return
+        }
+
+        if focusGroupSwitchTransitionToken != nil {
+            if let groupIdentifier = focusGroupSwitchSettlesGroupIdentifier {
+                scheduleFocusGroupRetiles(groupIdentifier)
+            }
             return
         }
 
@@ -1402,10 +1682,18 @@ final class AutoTiler {
         }
     }
 
-    private func handleApplicationUnhide(bundleIdentifier: String?) {
+    private func handleApplicationUnhide(application: NSRunningApplication?) {
         guard isRunning,
-              let bundleIdentifier,
+              let application,
+              let bundleIdentifier = application.bundleIdentifier,
               allowedBundleIdentifiers.contains(bundleIdentifier) else {
+            return
+        }
+
+        if let suppression = takeFocusGroupSwitchUnhideNotificationSuppression(
+            for: application.processIdentifier
+        ) {
+            handleFocusGroupSwitchNotification(suppression)
             return
         }
 
@@ -1426,19 +1714,23 @@ final class AutoTiler {
         }
     }
 
-    private func handleApplicationHide(bundleIdentifier: String?) {
+    private func handleApplicationHide(application: NSRunningApplication?) {
         guard isRunning,
-              let bundleIdentifier,
+              let application,
+              let bundleIdentifier = application.bundleIdentifier,
               allowedBundleIdentifiers.contains(bundleIdentifier) else {
+            return
+        }
+
+        if let suppression = takeFocusGroupSwitchHideNotificationSuppression(
+            for: application.processIdentifier
+        ) {
+            handleFocusGroupSwitchNotification(suppression)
             return
         }
 
         if propagatedHiddenBundleIdentifiers.remove(bundleIdentifier) != nil {
             scheduleEventScan()
-            return
-        }
-
-        if focusGroupSwitchHiddenBundleIdentifiers.remove(bundleIdentifier) != nil {
             return
         }
 
@@ -1448,6 +1740,76 @@ final class AutoTiler {
         let hiddenBundleIdentifiers = mover.hideApplications(bundleIdentifiers: relatedBundleIdentifiers)
         propagatedHiddenBundleIdentifiers.subtract(relatedBundleIdentifiers.subtracting(hiddenBundleIdentifiers))
         scheduleEventScan()
+    }
+
+    private func handleFocusGroupSwitchNotification(_ suppression: FocusGroupSwitchNotificationSuppression) {
+        guard suppression.sequence == focusGroupSwitchSequence else {
+            return
+        }
+
+        if let groupIdentifier = suppression.settlesGroupIdentifier {
+            scheduleFocusGroupRetiles(groupIdentifier)
+        } else {
+            scheduleFocusGroupWindowRefresh(sequence: suppression.sequence)
+        }
+    }
+
+    private func scheduleFocusGroupWindowRefresh(sequence: UInt64) {
+        pendingFocusGroupRefreshWorkItem?.cancel()
+
+        guard isRunning else {
+            pendingFocusGroupRefreshWorkItem = nil
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self,
+                      self.focusGroupSwitchSequence == sequence else {
+                    return
+                }
+
+                self.pendingFocusGroupRefreshWorkItem = nil
+                self.refreshKnownWindows()
+            }
+        }
+
+        pendingFocusGroupRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: workItem)
+    }
+
+    private func takeFocusGroupSwitchHideNotificationSuppression(
+        for processIdentifier: pid_t
+    ) -> FocusGroupSwitchNotificationSuppression? {
+        guard var suppressions = focusGroupSwitchHiddenNotificationSuppressionsByProcessIdentifier[processIdentifier],
+              !suppressions.isEmpty else {
+            return nil
+        }
+
+        let suppression = suppressions.removeFirst()
+        if suppressions.isEmpty {
+            focusGroupSwitchHiddenNotificationSuppressionsByProcessIdentifier.removeValue(forKey: processIdentifier)
+        } else {
+            focusGroupSwitchHiddenNotificationSuppressionsByProcessIdentifier[processIdentifier] = suppressions
+        }
+        return suppression
+    }
+
+    private func takeFocusGroupSwitchUnhideNotificationSuppression(
+        for processIdentifier: pid_t
+    ) -> FocusGroupSwitchNotificationSuppression? {
+        guard var suppressions = focusGroupSwitchUnhiddenNotificationSuppressionsByProcessIdentifier[processIdentifier],
+              !suppressions.isEmpty else {
+            return nil
+        }
+
+        let suppression = suppressions.removeFirst()
+        if suppressions.isEmpty {
+            focusGroupSwitchUnhiddenNotificationSuppressionsByProcessIdentifier.removeValue(forKey: processIdentifier)
+        } else {
+            focusGroupSwitchUnhiddenNotificationSuppressionsByProcessIdentifier[processIdentifier] = suppressions
+        }
+        return suppression
     }
 
     @discardableResult
@@ -1474,23 +1836,42 @@ final class AutoTiler {
         case kAXFocusedWindowChangedNotification:
             if keepsForcedTileLayoutStable {
                 scheduleForcedTileRestores()
+            } else if focusGroupSwitchTransitionToken != nil {
+                if let groupIdentifier = focusGroupSwitchSettlesGroupIdentifier {
+                    scheduleFocusGroupRetiles(groupIdentifier)
+                }
             } else {
                 scheduleFocusedWindowRetile()
             }
-        case kAXWindowMovedNotification,
-            kAXWindowResizedNotification:
+        case kAXWindowMovedNotification:
             if let element {
-                handleManualWindowAdjustment(of: element)
+                handleManualWindowAdjustment(of: element, kind: .moved)
+            }
+        case kAXWindowResizedNotification:
+            if let element {
+                handleManualWindowAdjustment(of: element, kind: .resized)
             }
         default:
             break
         }
     }
 
-    private func handleManualWindowAdjustment(of element: AXUIElement) {
+    private func handleManualWindowAdjustment(of element: AXUIElement,
+                                              kind: AutoTileWindowAdjustmentKinds) {
         guard isRunning,
-              !isApplyingTile,
-              let windowID = windowID(for: element),
+              !isApplyingTile else {
+            return
+        }
+
+        guard excludesManuallyMovedWindowsFromAutoTiling ||
+                keepsFullSizeWindowsOutOfAutoTiling else {
+            if keepsForcedTileLayoutStable {
+                scheduleForcedTileRestores()
+            }
+            return
+        }
+
+        guard let windowID = windowID(for: element),
               let currentFrame = mover.currentFrame(of: element) else {
             return
         }
@@ -1502,12 +1883,79 @@ final class AutoTiler {
             return
         }
 
-        if manuallyAdjustedWindowIDs.insert(windowID).inserted {
-            cancelPendingRetiles()
+        var resolvedKind = kind
+        if kind.contains(.moved) {
+            let usedWindowManagerShortcut = wasRecentlyMovedByWindowManagerShortcut(to: currentFrame)
+            if wasRecentlyDraggedByUser() || usedWindowManagerShortcut {
+                resolvedKind.insert(.userInitiatedMove)
+            }
+            if usedWindowManagerShortcut {
+                resolvedKind.insert(.windowManagerShortcut)
+            }
         }
 
         windowIDsPendingManualEvaluation.insert(windowID)
+        pendingAdjustmentKindsByWindowID[windowID, default: []].formUnion(resolvedKind)
+
+        let shouldProvisionallyExclude = keepsFullSizeWindowsOutOfAutoTiling ||
+            (excludesManuallyMovedWindowsFromAutoTiling && resolvedKind.contains(.userInitiatedMove))
+        if shouldProvisionallyExclude,
+           provisionallyExcludedWindowIDs.insert(windowID).inserted {
+            // Do not let a delayed focus/workspace retile snap a drag or
+            // maximize transition back before the Accessibility events settle.
+            invalidateForcedTileLayout()
+            cancelPendingRetiles()
+        }
+
         scheduleManualAdjustmentEvaluation()
+    }
+
+    private func wasRecentlyDraggedByUser(graceInterval: CFTimeInterval = 0.45) -> Bool {
+        let state = CGEventSourceStateID.hidSystemState
+        let secondsSinceDrag = CGEventSource.secondsSinceLastEventType(state,
+                                                                       eventType: .leftMouseDragged)
+        guard secondsSinceDrag.isFinite,
+              secondsSinceDrag >= 0,
+              secondsSinceDrag <= graceInterval else {
+            return false
+        }
+
+        if CGEventSource.buttonState(state, button: .left) {
+            return true
+        }
+
+        // AXMoved commonly arrives just after the title-bar drag releases.
+        let secondsSinceMouseUp = CGEventSource.secondsSinceLastEventType(state,
+                                                                          eventType: .leftMouseUp)
+        return secondsSinceMouseUp.isFinite &&
+            secondsSinceMouseUp >= 0 &&
+            secondsSinceMouseUp <= secondsSinceDrag + 0.02
+    }
+
+    private func wasRecentlyMovedByWindowManagerShortcut(
+        to frame: CGRect,
+        graceInterval: CFTimeInterval = 0.6
+    ) -> Bool {
+        let secondsSinceKeyDown = CGEventSource.secondsSinceLastEventType(.hidSystemState,
+                                                                          eventType: .keyDown)
+        guard secondsSinceKeyDown.isFinite,
+              secondsSinceKeyDown >= 0,
+              secondsSinceKeyDown <= graceInterval,
+              let visibleFrame = mover.visibleScreenFrame(containing: frame) else {
+            return false
+        }
+
+        // Raycast's Left Half / Right Half actions result in screen-height,
+        // half-width frames. Allow a modest tolerance for configured gaps and
+        // macOS window shadows while keeping unrelated app restores out.
+        let tolerance = max(16, min(32, visibleFrame.width * 0.025))
+        let matchesHeight = abs(frame.height - visibleFrame.height) <= tolerance
+        let matchesHalfWidth = abs(frame.width - (visibleFrame.width / 2)) <= tolerance
+        let matchesLeftEdge = abs(frame.minX - visibleFrame.minX) <= tolerance
+        let matchesRightEdge = abs(frame.maxX - visibleFrame.maxX) <= tolerance
+
+        return matchesHeight && matchesHalfWidth &&
+            (matchesLeftEdge || matchesRightEdge)
     }
 
     private func scheduleManualAdjustmentEvaluation() {
@@ -1526,98 +1974,138 @@ final class AutoTiler {
 
     private func evaluatePendingManualAdjustments() {
         let pendingWindowIDs = windowIDsPendingManualEvaluation
+        let pendingAdjustmentKinds = pendingAdjustmentKindsByWindowID
+        let provisionallyExcludedWindowIDsForEvaluation = provisionallyExcludedWindowIDs
+            .intersection(pendingWindowIDs)
         windowIDsPendingManualEvaluation = []
+        provisionallyExcludedWindowIDs.subtract(pendingWindowIDs)
+        pendingAdjustmentKindsByWindowID = [:]
 
         guard isRunning,
-              !isApplyingTile,
               !allowedBundleIdentifiers.isEmpty,
-              !pendingWindowIDs.isEmpty,
-              let snapshot = try? mover.visibleAutoTileWindows(allowedBundleIdentifiers: allowedBundleIdentifiers) else {
+              !pendingWindowIDs.isEmpty else {
             return
         }
+
+        guard !isApplyingTile else {
+            windowIDsPendingManualEvaluation.formUnion(pendingWindowIDs)
+            provisionallyExcludedWindowIDs.formUnion(provisionallyExcludedWindowIDsForEvaluation)
+            for (windowID, adjustmentKinds) in pendingAdjustmentKinds {
+                pendingAdjustmentKindsByWindowID[windowID, default: []].formUnion(adjustmentKinds)
+            }
+            scheduleManualAdjustmentEvaluation()
+            return
+        }
+
+        guard let snapshot = try? mover.visibleAutoTileWindows(
+            allowedBundleIdentifiers: allowedBundleIdentifiers
+        ) else {
+            windowIDsPendingManualEvaluation.formUnion(pendingWindowIDs)
+            provisionallyExcludedWindowIDs.formUnion(provisionallyExcludedWindowIDsForEvaluation)
+            for (windowID, adjustmentKinds) in pendingAdjustmentKinds {
+                pendingAdjustmentKindsByWindowID[windowID, default: []].formUnion(adjustmentKinds)
+            }
+            scheduleManualAdjustmentEvaluation()
+            return
+        }
+
+        synchronizeTemporarilyRemovedWindows(with: snapshot)
+        let previousManualWindowIDs = manuallyAdjustedWindowIDs
+        let previousFullSizeWindowIDs = fullSizeWindowIDs
+        let currentWindowIDs = Set(snapshot.map(\.id))
+        manuallyAdjustedWindowIDs.formIntersection(currentWindowIDs)
+        fullSizeWindowIDs.formIntersection(currentWindowIDs)
 
         for windowID in pendingWindowIDs {
             guard let window = snapshot.first(where: { $0.id == windowID }) else {
                 manuallyAdjustedWindowIDs.remove(windowID)
+                fullSizeWindowIDs.remove(windowID)
                 appliedFrameByWindowID.removeValue(forKey: windowID)
                 continue
             }
 
+            if temporarilyRemovedWindowsByID[windowID] != nil {
+                manuallyAdjustedWindowIDs.remove(windowID)
+                fullSizeWindowIDs.remove(windowID)
+                appliedFrameByWindowID[windowID] = window.frame
+                continue
+            }
+
             let referenceFrame = appliedFrameByWindowID[windowID]
+            let wasManuallyExcluded = manuallyAdjustedWindowIDs.contains(windowID)
 
             // Settled back onto the reference frame (e.g. an animated echo): not a manual change.
             if let referenceFrame,
                frameApproximatelyEqual(window.frame, referenceFrame) {
-                manuallyAdjustedWindowIDs.remove(windowID)
                 continue
             }
 
-            // Only re-tile when the window was moved or resized enough to reshape the tile set.
-            // Small nudges keep the user's frame and stay out of tiling.
-            let shouldReengageWindow: Bool
-            if let referenceFrame {
-                shouldReengageWindow = windowWasReshapedSignificantly(from: referenceFrame,
-                                                                      to: window.frame,
-                                                                      in: window.screenVisibleFrame)
-            } else {
-                shouldReengageWindow = windowHasVisibleTilePeer(window, in: snapshot)
-            }
+            let adjustmentKinds = pendingAdjustmentKinds[windowID] ?? []
+            let changedSize = referenceFrame.map {
+                abs($0.width - window.frame.width) > 6 ||
+                    abs($0.height - window.frame.height) > 6
+            } ?? adjustmentKinds.contains(.resized)
+            let isManualPositionChange = adjustmentKinds.contains(.moved) &&
+                adjustmentKinds.contains(.userInitiatedMove) &&
+                (!changedSize || adjustmentKinds.contains(.windowManagerShortcut))
+            let wasFullSize = fullSizeWindowIDs.contains(windowID)
+            let isFullSize = keepsFullSizeWindowsOutOfAutoTiling && windowIsFullSize(window)
 
-            if shouldReengageWindow {
-                reengageSnappedWindow(window)
-            } else {
-                // Honor the manual frame and use it as the new reference position.
+            if isFullSize {
+                if wasFullSize, isManualPositionChange {
+                    // Match the manual-move cycle: a second deliberate drag
+                    // opts even a still-full-size window back into tiling.
+                    fullSizeWindowIDs.remove(windowID)
+                    manuallyAdjustedWindowIDs.remove(windowID)
+                    appliedFrameByWindowID[windowID] = window.frame
+                    continue
+                }
+
+                fullSizeWindowIDs.insert(windowID)
+                // Full-size state takes precedence. A companion move notification
+                // must not leave the window manually excluded after it is made smaller.
+                manuallyAdjustedWindowIDs.remove(windowID)
                 appliedFrameByWindowID[windowID] = window.frame
+                clearFocusedPrimaryState(for: groupIdentifiers(for: window))
+                continue
+            }
+
+            if wasFullSize {
+                fullSizeWindowIDs.remove(windowID)
+                manuallyAdjustedWindowIDs.remove(windowID)
+                appliedFrameByWindowID[windowID] = window.frame
+                continue
+            }
+
+            if excludesManuallyMovedWindowsFromAutoTiling ||
+                keepsFullSizeWindowsOutOfAutoTiling {
+                if isManualPositionChange {
+                    if wasManuallyExcluded {
+                        // A second deliberate drag is the user's signal to put
+                        // this window back under automatic layout management.
+                        manuallyAdjustedWindowIDs.remove(windowID)
+                    } else {
+                        manuallyAdjustedWindowIDs.insert(windowID)
+                        clearFocusedPrimaryState(for: groupIdentifiers(for: window))
+                    }
+                    appliedFrameByWindowID[windowID] = window.frame
+                }
+            } else {
+                manuallyAdjustedWindowIDs.remove(windowID)
             }
         }
-    }
 
-    private func reengageSnappedWindow(_ window: AutoTileWindow) {
-        manuallyAdjustedWindowIDs.remove(window.id)
-
-        let target = WindowTarget(applicationName: window.applicationName,
-                                  bundleIdentifier: window.bundleIdentifier,
-                                  processIdentifier: window.processIdentifier,
-                                  window: window.window)
-
-        do {
-            let result = try retileAroundMovedWindow(target, movedFrame: window.frame)
-            if result.tiledWindowCount > 0 {
-                handler(.success(result))
-            }
-        } catch {
-            // Leave the window under management even if retiling around it failed.
-        }
-    }
-
-    private func windowWasReshapedSignificantly(from oldFrame: CGRect,
-                                                to newFrame: CGRect,
-                                                in visibleFrame: CGRect) -> Bool {
-        guard visibleFrame.width > 0, visibleFrame.height > 0 else {
-            return false
+        let didChangeExclusions = manuallyAdjustedWindowIDs != previousManualWindowIDs ||
+            fullSizeWindowIDs != previousFullSizeWindowIDs
+        if didChangeExclusions || !provisionallyExcludedWindowIDsForEvaluation.isEmpty {
+            invalidateForcedTileLayout()
         }
 
-        let originDistance = hypot(newFrame.minX - oldFrame.minX,
-                                   newFrame.minY - oldFrame.minY)
-        let widthDifference = abs(newFrame.width - oldFrame.width)
-        let heightDifference = abs(newFrame.height - oldFrame.height)
-        let movementThreshold = min(visibleFrame.width, visibleFrame.height) * 0.18
-        let resizeThreshold: CGFloat = 6
-        return originDistance > movementThreshold || widthDifference > resizeThreshold || heightDifference > resizeThreshold
-    }
-
-    private func windowHasVisibleTilePeer(_ window: AutoTileWindow,
-                                          in windows: [AutoTileWindow]) -> Bool {
-        let windowGroupIdentifiers = groupIdentifiers(for: window)
-        guard !windowGroupIdentifiers.isEmpty else {
-            return false
-        }
-
-        let windowScreenKey = AutoTileScreenKey(window.screenVisibleFrame)
-        return windows.contains { otherWindow in
-            otherWindow.id != window.id &&
-                AutoTileScreenKey(otherWindow.screenVisibleFrame) == windowScreenKey &&
-                !groupIdentifiers(for: otherWindow).intersection(windowGroupIdentifiers).isEmpty
+        if keepsForcedTileLayoutStable {
+            scheduleForcedTileRestores()
+        } else {
+            cancelPendingRetiles()
+            retileVisibleWindows()
         }
     }
 
@@ -1633,6 +2121,80 @@ final class AutoTiler {
             frames[window.id] = window.frame
         }
         appliedFrameByWindowID = frames
+    }
+
+    private func refreshFullSizeWindowExclusionsAndRetile() {
+        guard isRunning,
+              keepsFullSizeWindowsOutOfAutoTiling,
+              !allowedBundleIdentifiers.isEmpty,
+              let windows = try? mover.visibleAutoTileWindows(allowedBundleIdentifiers: allowedBundleIdentifiers) else {
+            return
+        }
+
+        refreshAccessibilityObservers(visibleWindows: windows)
+        _ = synchronizeFullSizeWindowExclusions(with: windows,
+                                                detectsNewGeometryMatches: true,
+                                                includesAppliedGeometryMatches: true)
+        reconcileVisibleWindows()
+    }
+
+    @discardableResult
+    private func synchronizeFullSizeWindowExclusions(
+        with windows: [AutoTileWindow],
+        detectsNewGeometryMatches: Bool = false,
+        includesAppliedGeometryMatches: Bool = false
+    ) -> Bool {
+        let previousWindowIDs = fullSizeWindowIDs
+
+        guard keepsFullSizeWindowsOutOfAutoTiling else {
+            fullSizeWindowIDs = []
+            return previousWindowIDs != fullSizeWindowIDs
+        }
+
+        let currentWindowIDs = Set(windows.map(\.id))
+        fullSizeWindowIDs.formIntersection(currentWindowIDs)
+
+        for window in windows {
+            if window.isNativeFullScreen {
+                fullSizeWindowIDs.insert(window.id)
+                manuallyAdjustedWindowIDs.remove(window.id)
+                continue
+            }
+
+            let isGeometryMatch = windowIsFullyExpanded(window)
+            if fullSizeWindowIDs.contains(window.id) {
+                if !isGeometryMatch {
+                    fullSizeWindowIDs.remove(window.id)
+                    manuallyAdjustedWindowIDs.remove(window.id)
+                }
+            } else if detectsNewGeometryMatches,
+                      isGeometryMatch,
+                      includesAppliedGeometryMatches ||
+                        (appliedFrameByWindowID[window.id].map({ !frameApproximatelyEqual($0, window.frame) }) ?? true) {
+                fullSizeWindowIDs.insert(window.id)
+                manuallyAdjustedWindowIDs.remove(window.id)
+            }
+        }
+
+        return previousWindowIDs != fullSizeWindowIDs
+    }
+
+    private func windowIsFullSize(_ window: AutoTileWindow) -> Bool {
+        window.isNativeFullScreen || windowIsFullyExpanded(window)
+    }
+
+    private func windowIsFullyExpanded(_ window: AutoTileWindow) -> Bool {
+        let frame = window.frame
+        let visibleFrame = window.screenVisibleFrame
+        let tolerance: CGFloat = 8
+
+        guard visibleFrame.width > 0,
+              visibleFrame.height > 0 else {
+            return false
+        }
+
+        return abs(frame.width - visibleFrame.width) <= tolerance &&
+            abs(frame.height - visibleFrame.height) <= tolerance
     }
 
     private func frameApproximatelyEqual(_ lhs: CGRect, _ rhs: CGRect, tolerance: CGFloat = 6) -> Bool {
@@ -1655,6 +2217,14 @@ final class AutoTiler {
     private func scheduleFocusedWindowRetile(delay: TimeInterval? = nil) {
         pendingFocusedWindowRetileWorkItem?.cancel()
 
+        if focusGroupSwitchTransitionToken != nil {
+            pendingFocusedWindowRetileWorkItem = nil
+            if let groupIdentifier = focusGroupSwitchSettlesGroupIdentifier {
+                scheduleFocusGroupRetiles(groupIdentifier)
+            }
+            return
+        }
+
         guard isRunning,
               !keepsForcedTileLayoutStable else {
             pendingFocusedWindowRetileWorkItem = nil
@@ -1676,7 +2246,7 @@ final class AutoTiler {
         DispatchQueue.main.asyncAfter(deadline: .now() + (delay ?? eventScanDelay), execute: workItem)
     }
 
-    private func cancelPendingRetiles() {
+    private func cancelPendingRetiles(preservingFocusGroupRetiles: Bool = false) {
         pendingScanWorkItem?.cancel()
         pendingScanWorkItem = nil
         pendingFocusedWindowRetileWorkItem?.cancel()
@@ -1687,8 +2257,34 @@ final class AutoTiler {
         pendingRetileReinforcementWorkItems = []
         pendingMainAppRetileWorkItems.forEach { $0.cancel() }
         pendingMainAppRetileWorkItems = []
-        pendingFocusGroupRetileWorkItems.forEach { $0.cancel() }
-        pendingFocusGroupRetileWorkItems = []
+        if !preservingFocusGroupRetiles {
+            cancelAllFocusGroupRetiles()
+        }
+        pendingFocusGroupRefreshWorkItem?.cancel()
+        pendingFocusGroupRefreshWorkItem = nil
+        pendingForcedTileRestoreWorkItems.forEach { $0.cancel() }
+        pendingForcedTileRestoreWorkItems = []
+    }
+
+    private func cancelFocusGroupRetiles(_ groupIdentifier: Int) {
+        pendingFocusGroupRetileWorkItemsByGroup
+            .removeValue(forKey: groupIdentifier)?
+            .forEach { $0.cancel() }
+        focusGroupRetileGenerationByGroup[groupIdentifier] =
+            (focusGroupRetileGenerationByGroup[groupIdentifier] ?? 0) &+ 1
+    }
+
+    private func cancelAllFocusGroupRetiles() {
+        pendingFocusGroupRetileWorkItemsByGroup.values
+            .flatMap { $0 }
+            .forEach { $0.cancel() }
+        pendingFocusGroupRetileWorkItemsByGroup = [:]
+        focusGroupRetileGenerationByGroup = [:]
+    }
+
+    private func invalidateForcedTileLayout() {
+        keepsForcedTileLayoutStable = false
+        forcedTileFramesByWindowID = [:]
         pendingForcedTileRestoreWorkItems.forEach { $0.cancel() }
         pendingForcedTileRestoreWorkItems = []
     }
@@ -1727,15 +2323,36 @@ final class AutoTiler {
         do {
             let visibleWindows = try mover.visibleAutoTileWindows(allowedBundleIdentifiers: allowedBundleIdentifiers,
                                                                   includesOffscreenWindows: true)
+            synchronizeTemporarilyRemovedWindows(with: visibleWindows)
+            let didChangeFullSizeExclusions = synchronizeFullSizeWindowExclusions(
+                with: visibleWindows,
+                detectsNewGeometryMatches: true
+            )
+            if didChangeFullSizeExclusions {
+                invalidateForcedTileLayout()
+                scheduleSettledRetile()
+                return
+            }
+
             let currentWindowIDs = Set(visibleWindows.map(\.id))
             guard Set(forcedTileFramesByWindowID.keys).isSubset(of: currentWindowIDs) else {
-                keepsForcedTileLayoutStable = false
-                forcedTileFramesByWindowID = [:]
+                invalidateForcedTileLayout()
+                scheduleSettledRetile()
+                return
+            }
+
+            let activeWindowIDs = Set(activeAutoTileWindows(from: visibleWindows).map(\.id))
+            let framesToRestore = forcedTileFramesByWindowID.filter { windowID, _ in
+                activeWindowIDs.contains(windowID)
+            }
+            guard framesToRestore.count == forcedTileFramesByWindowID.count else {
+                invalidateForcedTileLayout()
+                scheduleSettledRetile()
                 return
             }
 
             isApplyingTile = true
-            let result = mover.restoreAutoTileFrames(forcedTileFramesByWindowID,
+            let result = mover.restoreAutoTileFrames(framesToRestore,
                                                      windows: visibleWindows)
             appliedFrameByWindowID.merge(result.appliedFramesByWindowID) { _, new in new }
             isApplyingTile = false
@@ -2132,7 +2749,12 @@ final class AutoTiler {
             }
         }
 
-        self.appliedFrameByWindowID.merge(appliedFramesByWindowID) { _, new in new }
+        // Refresh the baseline even when no AX write was necessary. Display,
+        // wake, and app-restoration changes can otherwise leave an old frame
+        // that makes a later Accessibility echo look like a user move.
+        for window in windows where !windowIDsPendingManualEvaluation.contains(window.id) {
+            self.appliedFrameByWindowID[window.id] = appliedFramesByWindowID[window.id] ?? window.frame
+        }
 
         return AutoTileResult(tiledWindowCount: tiledWindowCount,
                               screenCount: screenKeys.count,
@@ -2152,12 +2774,13 @@ final class AutoTiler {
         enlargedWindowSlotsByGroup.removeValue(forKey: groupIdentifier)
     }
 
-    private func captureForcedTileLayoutSnapshot() {
-        guard keepsForcedTileLayoutStable else {
-            forcedTileFramesByWindowID = [:]
-            return
+    private func clearFocusedPrimaryState(for groupIdentifiers: Set<Int>) {
+        for groupIdentifier in groupIdentifiers {
+            clearFocusedPrimaryState(for: groupIdentifier)
         }
+    }
 
+    private func captureForcedTileLayoutSnapshot() -> Bool {
         do {
             let visibleWindows = try mover.visibleAutoTileWindows(allowedBundleIdentifiers: allowedBundleIdentifiers,
                                                                   includesOffscreenWindows: true)
@@ -2165,8 +2788,10 @@ final class AutoTiler {
             forcedTileFramesByWindowID = Dictionary(uniqueKeysWithValues: windows.map { window in
                 (window.id, window.frame)
             })
+            return !forcedTileFramesByWindowID.isEmpty
         } catch {
             forcedTileFramesByWindowID = [:]
+            return false
         }
     }
 
@@ -2214,12 +2839,18 @@ final class AutoTiler {
     }
 
     private func activeAutoTileWindows(from windows: [AutoTileWindow]) -> [AutoTileWindow] {
-        guard !temporarilyRemovedWindowsByID.isEmpty || !manuallyAdjustedWindowIDs.isEmpty else {
+        guard !temporarilyRemovedWindowsByID.isEmpty ||
+                !manuallyAdjustedWindowIDs.isEmpty ||
+                !fullSizeWindowIDs.isEmpty ||
+                !provisionallyExcludedWindowIDs.isEmpty else {
             return windows
         }
 
         return windows.filter {
-            temporarilyRemovedWindowsByID[$0.id] == nil && !manuallyAdjustedWindowIDs.contains($0.id)
+            temporarilyRemovedWindowsByID[$0.id] == nil &&
+                !manuallyAdjustedWindowIDs.contains($0.id) &&
+                !fullSizeWindowIDs.contains($0.id) &&
+                !provisionallyExcludedWindowIDs.contains($0.id)
         }
     }
 
@@ -2377,6 +3008,9 @@ final class AutoTiler {
                                                  newWindowIDs: Set<AutoTileWindowID>,
                                                  openingContext: AutoTileOpeningContext?) {
         let currentWindowIDs = Set(windows.map(\.id))
+            .union(temporarilyRemovedWindowsByID.keys)
+            .union(manuallyAdjustedWindowIDs)
+            .union(fullSizeWindowIDs)
         windowGroupIdentifiersByID = windowGroupIdentifiersByID.filter { currentWindowIDs.contains($0.key) }
 
         for window in windows {
