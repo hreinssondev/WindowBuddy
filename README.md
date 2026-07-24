@@ -2,22 +2,12 @@
 
 WindowBuddy is a macOS menu bar app for arranging and orchestrating application windows. It provides automatic tiling groups, focus groups, focused-window resizing, and global hotkeys for common window workflows.
 
-## Features
-
 - Configure app groups for automatic tiling.
 - Choose per-group screen layout, tile direction, and maximum columns.
 - Widen the focused tiled window, with per-app resize behavior.
 - Hide, reveal, and switch focus groups together.
 - Remember and manage Finder's last window behavior.
 - Run from the menu bar, with an optional Dock icon.
-
-## Hotkeys
-
-- `Option` + `Up Arrow`: Fill the frontmost window and temporarily remove it from tiling.
-- `Option` + `Down Arrow`: Restore the most recently removed window to tiling.
-- `Command` + `Shift` + `7`: Resize auto-tiled windows.
-- `Command` + `Shift` + `6`: Toggle focus groups.
-- `Command` + `Shift` + `8`: Open settings.
 
 ## Requirements
 
